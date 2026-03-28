@@ -163,7 +163,7 @@ int main(int argc, char ** argv) {
     printf("Warming up...\n");
     fflush(stdout);
     for (int w = 0; w < 2; ++w) {
-        llama_set_attn_mask(ctx, nullptr, nullptr, 0);
+        llama_set_attn_mask(ctx, nullptr, nullptr, 0, 0, -1);
         run_decode(ctx, tok_buf.data(), n_tokens);
     }
 
@@ -171,7 +171,7 @@ int main(int argc, char ** argv) {
         results[c].name = configs[c].name;
 
         for (int i = 0; i < n_iter; ++i) {
-            llama_set_attn_mask(ctx, configs[c].mask, configs[c].pos, configs[c].n_pos);
+            llama_set_attn_mask(ctx, configs[c].mask, configs[c].pos, configs[c].n_pos, 0, -1);
             double t = run_decode(ctx, tok_buf.data(), n_tokens);
             if (t < 0.0) {
                 fprintf(stderr, "Decode failed for config %s iter %d\n", configs[c].name, i);
@@ -201,7 +201,7 @@ int main(int argc, char ** argv) {
 
     printf("\n");
 
-    llama_set_attn_mask(ctx, nullptr, nullptr, 0);
+    llama_set_attn_mask(ctx, nullptr, nullptr, 0, 0, -1);
     llama_free(ctx);
     llama_model_free(model);
 

@@ -971,11 +971,15 @@ extern "C" {
     // The mask is applied on top of the default causal/non-causal mask (AND logic: custom can only
     // restrict, never open what the default mask blocks).
     //
-    // mask:      float array [n_pos * n_pos], row-major. mask[i * n_pos + j]:
+    // mask:      float array [n_head_groups * n_pos * n_pos], row-major.
+    //            For each head group g, mask[g * n_pos * n_pos + i * n_pos + j]:
     //              0.0f     = defer to default mask (allow if default allows)
     //             -INFINITY = block attention from position[i] to position[j]
     // positions: array of n_pos llama_pos values the mask rows/columns correspond to
     // n_pos:     number of positions in the mask
+    // n_head_groups: number of head groups in the mask (0 or 1 = broadcast same mask to all heads,
+    //               n_head = per-head mask, must divide n_head evenly for group masking)
+    // slot_id:   slot to apply the mask to (-1 = global/all slots, >= 0 = specific slot)
     //
     // Pass NULL mask to clear and restore default behavior.
     // The mask is copied internally — the caller can free their buffers after this call.
@@ -983,7 +987,9 @@ extern "C" {
             struct llama_context * ctx,
             const float          * mask,
             const llama_pos      * positions,
-            int32_t                n_pos);
+            int32_t                n_pos,
+            int32_t                n_head_groups,
+            int32_t                slot_id);
 
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.

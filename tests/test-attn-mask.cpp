@@ -160,7 +160,7 @@ int main(int argc, char ** argv) {
 
     // === Test 2: Custom mask = nullptr (should be identical) ===
     printf("\n=== Test 2: Custom mask = nullptr ===\n");
-    llama_set_attn_mask(ctx, nullptr, nullptr, 0);
+    llama_set_attn_mask(ctx, nullptr, nullptr, 0, 0, -1);
     {
         auto logits = eval_prompt(tctx, prompt);
         float diff = logits_diff(logits_baseline, logits);
@@ -179,7 +179,7 @@ int main(int argc, char ** argv) {
         auto positions = make_positions(n_tok);
         auto mask = make_window_mask(n_tok, 2);
 
-        llama_set_attn_mask(ctx, mask.data(), positions.data(), n_tok);
+        llama_set_attn_mask(ctx, mask.data(), positions.data(), n_tok, 0, -1);
         auto logits = eval_prompt(tctx, prompt);
         float diff = logits_diff(logits_baseline, logits);
         printf("  diff vs baseline: %.6e\n", diff);
@@ -195,7 +195,7 @@ int main(int argc, char ** argv) {
 
     // === Test 4: Clear mask — should restore baseline ===
     printf("\n=== Test 4: Clear mask (restore baseline) ===\n");
-    llama_set_attn_mask(ctx, nullptr, nullptr, 0);
+    llama_set_attn_mask(ctx, nullptr, nullptr, 0, 0, -1);
     {
         auto logits = eval_prompt(tctx, prompt);
         float diff = logits_diff(logits_baseline, logits);
@@ -215,7 +215,7 @@ int main(int argc, char ** argv) {
         auto positions = make_positions(n_tok);
         auto mask = make_uniform_mask(n_tok, 0.0f);
 
-        llama_set_attn_mask(ctx, mask.data(), positions.data(), n_tok);
+        llama_set_attn_mask(ctx, mask.data(), positions.data(), n_tok, 0, -1);
         auto logits = eval_prompt(tctx, prompt);
         float diff = logits_diff(logits_baseline, logits);
         printf("  diff vs baseline: %.6e\n", diff);
@@ -236,7 +236,7 @@ int main(int argc, char ** argv) {
         auto positions = make_positions(n_tok);
         auto mask = make_uniform_mask(n_tok, -INFINITY);
 
-        llama_set_attn_mask(ctx, mask.data(), positions.data(), n_tok);
+        llama_set_attn_mask(ctx, mask.data(), positions.data(), n_tok, 0, -1);
         auto logits = eval_prompt(tctx, prompt);
         float diff = logits_diff(logits_baseline, logits);
         printf("  diff vs baseline: %.6e\n", diff);
@@ -259,12 +259,12 @@ int main(int argc, char ** argv) {
 
         // Decode with window=1
         auto mask1 = make_window_mask(n_tok, 1);
-        llama_set_attn_mask(ctx, mask1.data(), positions.data(), n_tok);
+        llama_set_attn_mask(ctx, mask1.data(), positions.data(), n_tok, 0, -1);
         auto logits_w1 = eval_prompt(tctx, prompt);
 
         // Decode with window=4
         auto mask2 = make_window_mask(n_tok, 4);
-        llama_set_attn_mask(ctx, mask2.data(), positions.data(), n_tok);
+        llama_set_attn_mask(ctx, mask2.data(), positions.data(), n_tok, 0, -1);
         auto logits_w4 = eval_prompt(tctx, prompt);
 
         float diff_w1_base = logits_diff(logits_baseline, logits_w1);
@@ -293,7 +293,7 @@ int main(int argc, char ** argv) {
     }
 
     // Clear mask for clean exit
-    llama_set_attn_mask(ctx, nullptr, nullptr, 0);
+    llama_set_attn_mask(ctx, nullptr, nullptr, 0, 0, -1);
 
     printf("\n========================================\n");
     printf("Results: %d passed, %d failed\n", n_passed, n_failed);
