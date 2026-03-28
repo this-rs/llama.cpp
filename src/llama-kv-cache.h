@@ -6,6 +6,7 @@
 #include "llama-memory.h"
 
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 struct llama_cparams;
@@ -202,7 +203,10 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn,
+                              const float * custom_mask = nullptr, const llama_pos * custom_mask_pos = nullptr, int32_t custom_mask_n_pos = 0,
+                              int32_t custom_mask_n_head_groups = 1,
+                              const std::pair<llama_pos, int32_t> * custom_mask_sorted_pos = nullptr) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -367,7 +371,10 @@ public:
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn,
+                              const float * custom_mask = nullptr, const llama_pos * custom_mask_pos = nullptr, int32_t custom_mask_n_pos = 0,
+                              int32_t custom_mask_n_head_groups = 1,
+                              const std::pair<llama_pos, int32_t> * custom_mask_sorted_pos = nullptr) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
