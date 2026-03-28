@@ -9,6 +9,12 @@
 // 5. Full zeros mask (all visible) — should be identical to baseline (causal still applied)
 // 6. Full -inf mask (nothing visible) — should differ from baseline
 // 7. Dynamic mask change between two decodes — second mask should take effect
+// 8. Per-head broadcast (n_head_groups=0) — identical to baseline
+// 9. Per-head mask (n_head_groups=n_head) — different from broadcast
+// 10. Grouped heads (n_head_groups=n_head/n_kv_head) — different from both
+// 11. Clear after per-head — restore baseline
+// 12. Multi-slot: per-head on slot 0, broadcast on global
+// 13. Per-head uniform zeros — identical to baseline (causal still applied per-head)
 
 #include "llama.h"
 #include "common.h"
@@ -100,6 +106,34 @@ static std::vector<float> make_window_mask(int n, int window) {
     return mask;
 }
 
+// Helper: build per-head window mask where each head has a different window size
+// mask layout: [n_heads * n * n], head h has window = min_window + h * (max_window - min_window) / (n_heads - 1)
+static std::vector<float> make_perhead_window_mask(int n, int n_heads, int min_window, int max_window) {
+    std::vector<float> mask(n_heads * n * n);
+    for (int h = 0; h < n_heads; ++h) {
+        int window = (n_heads > 1)
+            ? min_window + h * (max_window - min_window) / (n_heads - 1)
+            : min_window;
+        for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < n; ++j) {
+                float val;
+                if (j <= i && (i - j) <= window) {
+                    val = 0.0f;    // visible
+                } else {
+                    val = -INFINITY; // masked
+                }
+                mask[h * n * n + i * n + j] = val;
+            }
+        }
+    }
+    return mask;
+}
+
+// Helper: build per-head uniform mask (same value for all positions, per head)
+static std::vector<float> make_perhead_uniform_mask(int n, int n_heads, float val) {
+    return std::vector<float>(n_heads * n * n, val);
+}
+
 int main(int argc, char ** argv) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <model.gguf>\n", argv[0]);
@@ -145,7 +179,10 @@ int main(int argc, char ** argv) {
         return 1;
     }
     const int n_tok = tctx.n_tokens;
+    const int n_head    = llama_model_n_head(model);
+    const int n_head_kv = llama_model_n_head_kv(model);
     printf("Prompt: \"%s\" → %d tokens\n", prompt, n_tok);
+    printf("Model: n_head=%d, n_head_kv=%d\n", n_head, n_head_kv);
 
     // === Test 1: Baseline (no custom mask) ===
     printf("\n=== Test 1: Baseline (no custom mask) ===\n");
@@ -289,6 +326,181 @@ int main(int argc, char ** argv) {
         }
         if (ok) {
             pass("dynamic mask change correctly applies different masks across decodes");
+        }
+    }
+
+    // =============================================
+    // Per-head mask tests (require n_head from model)
+    // =============================================
+
+    // === Test 8: Per-head broadcast (n_head_groups=0) — should be identical to baseline ===
+    printf("\n=== Test 8: Per-head broadcast (n_head_groups=0, explicit) ===\n");
+    {
+        auto positions = make_positions(n_tok);
+        auto mask = make_uniform_mask(n_tok, 0.0f);
+
+        // n_head_groups=0 means broadcast — same mask for all heads
+        llama_set_attn_mask(ctx, mask.data(), positions.data(), n_tok, 0, -1);
+        auto logits = eval_prompt(tctx, prompt);
+        float diff = logits_diff(logits_baseline, logits);
+        printf("  diff vs baseline: %.6e\n", diff);
+        if (diff < 1e-5f) {
+            pass("per-head broadcast (n_head_groups=0) identical to baseline");
+        } else {
+            char buf[128]; snprintf(buf, sizeof(buf), "per-head broadcast should match baseline (diff=%.6e)", diff);
+            fail(buf);
+        }
+    }
+    llama_set_attn_mask(ctx, nullptr, nullptr, 0, 0, -1);
+
+    // === Test 9: Per-head mask (n_head_groups=n_head) — each head gets different window ===
+    printf("\n=== Test 9: Per-head mask (n_head_groups=%d) ===\n", n_head);
+    {
+        auto positions = make_positions(n_tok);
+        // Head 0 gets window=1 (very restrictive), head n_head-1 gets window=n_tok (full causal)
+        auto mask = make_perhead_window_mask(n_tok, n_head, 1, n_tok);
+
+        llama_set_attn_mask(ctx, mask.data(), positions.data(), n_tok, n_head, -1);
+        auto logits_perhead = eval_prompt(tctx, prompt);
+
+        // Compare vs broadcast with window=1
+        auto mask_bcast = make_window_mask(n_tok, 1);
+        llama_set_attn_mask(ctx, mask_bcast.data(), positions.data(), n_tok, 0, -1);
+        auto logits_bcast_w1 = eval_prompt(tctx, prompt);
+
+        float diff_perhead_bcast = logits_diff(logits_perhead, logits_bcast_w1);
+        float diff_perhead_base  = logits_diff(logits_perhead, logits_baseline);
+
+        printf("  per-head vs broadcast(w=1): %.6e\n", diff_perhead_bcast);
+        printf("  per-head vs baseline:       %.6e\n", diff_perhead_base);
+
+        bool ok = true;
+        if (diff_perhead_bcast <= 0.01f) {
+            fail("per-head should differ from uniform broadcast window=1"); ok = false;
+        }
+        if (diff_perhead_base <= 0.01f) {
+            fail("per-head should differ from baseline (no mask)"); ok = false;
+        }
+        if (ok) {
+            char buf[256]; snprintf(buf, sizeof(buf),
+                "per-head mask produces distinct output (vs bcast=%.3e, vs base=%.3e)",
+                diff_perhead_bcast, diff_perhead_base);
+            pass(buf);
+        }
+    }
+    llama_set_attn_mask(ctx, nullptr, nullptr, 0, 0, -1);
+
+    // === Test 10: Grouped heads (n_head_groups = n_head/n_head_kv = GQA ratio) ===
+    {
+        const int n_groups = (n_head_kv > 0 && n_head % n_head_kv == 0)
+            ? n_head / n_head_kv : 0;
+
+        if (n_groups > 1) {
+            printf("\n=== Test 10: Grouped heads (n_head_groups=%d, GQA ratio) ===\n", n_groups);
+
+            auto positions = make_positions(n_tok);
+            auto mask_grouped = make_perhead_window_mask(n_tok, n_groups, 1, n_tok);
+
+            llama_set_attn_mask(ctx, mask_grouped.data(), positions.data(), n_tok, n_groups, -1);
+            auto logits_grouped = eval_prompt(tctx, prompt);
+
+            // Also get per-head result for comparison
+            auto mask_full = make_perhead_window_mask(n_tok, n_head, 1, n_tok);
+            llama_set_attn_mask(ctx, mask_full.data(), positions.data(), n_tok, n_head, -1);
+            auto logits_full = eval_prompt(tctx, prompt);
+
+            float diff_grouped_base = logits_diff(logits_grouped, logits_baseline);
+            float diff_grouped_full = logits_diff(logits_grouped, logits_full);
+
+            printf("  grouped vs baseline:  %.6e\n", diff_grouped_base);
+            printf("  grouped vs full per-head: %.6e\n", diff_grouped_full);
+
+            bool ok = true;
+            if (diff_grouped_base <= 0.01f) {
+                fail("grouped heads should differ from baseline"); ok = false;
+            }
+            if (diff_grouped_full <= 0.001f) {
+                // grouped and full per-head use different granularity, should differ
+                fail("grouped heads should differ from full per-head"); ok = false;
+            }
+            if (ok) {
+                char buf[256]; snprintf(buf, sizeof(buf),
+                    "grouped heads (%d groups) produces distinct output (vs base=%.3e, vs full=%.3e)",
+                    n_groups, diff_grouped_base, diff_grouped_full);
+                pass(buf);
+            }
+        } else {
+            printf("\n=== Test 10: Grouped heads — SKIPPED (n_head=%d, n_head_kv=%d, no valid grouping) ===\n",
+                   n_head, n_head_kv);
+            pass("grouped heads test skipped (model has no GQA or invalid grouping)");
+        }
+    }
+    llama_set_attn_mask(ctx, nullptr, nullptr, 0, 0, -1);
+
+    // === Test 11: Clear after per-head — should restore baseline ===
+    printf("\n=== Test 11: Clear after per-head (restore baseline) ===\n");
+    {
+        auto positions = make_positions(n_tok);
+        auto mask = make_perhead_window_mask(n_tok, n_head, 1, 2);
+
+        // Set per-head mask
+        llama_set_attn_mask(ctx, mask.data(), positions.data(), n_tok, n_head, -1);
+        eval_prompt(tctx, prompt); // decode with per-head
+
+        // Clear
+        llama_set_attn_mask(ctx, nullptr, nullptr, 0, 0, -1);
+        auto logits = eval_prompt(tctx, prompt);
+        float diff = logits_diff(logits_baseline, logits);
+        printf("  diff vs baseline after clear: %.6e\n", diff);
+        if (diff < 1e-5f) {
+            pass("clear after per-head restores baseline");
+        } else {
+            char buf[128]; snprintf(buf, sizeof(buf), "clear after per-head should restore baseline (diff=%.6e)", diff);
+            fail(buf);
+        }
+    }
+
+    // === Test 12: Multi-slot — per-head on slot 0, different on global ===
+    printf("\n=== Test 12: Multi-slot (per-head slot 0 + broadcast global) ===\n");
+    {
+        auto positions = make_positions(n_tok);
+
+        // Set global broadcast mask (window=3)
+        auto mask_global = make_window_mask(n_tok, 3);
+        llama_set_attn_mask(ctx, mask_global.data(), positions.data(), n_tok, 0, -1);
+
+        // Set per-head mask on slot 0 (window varies per head)
+        auto mask_slot0 = make_perhead_window_mask(n_tok, n_head, 1, n_tok);
+        llama_set_attn_mask(ctx, mask_slot0.data(), positions.data(), n_tok, n_head, 0);
+
+        // Note: we can't easily test which slot is used during decode without server mode,
+        // but we verify it doesn't crash and produces output
+        auto logits = eval_prompt(tctx, prompt);
+        if (!logits.empty()) {
+            pass("multi-slot set (per-head slot 0 + broadcast global) runs without crash");
+        } else {
+            fail("multi-slot set crashed or produced empty logits");
+        }
+
+        // Clear all slots
+        llama_set_attn_mask(ctx, nullptr, nullptr, 0, 0, -1);
+    }
+
+    // === Test 13: Per-head uniform zeros — identical to baseline (causal still applies) ===
+    printf("\n=== Test 13: Per-head uniform zeros (all visible, per-head) ===\n");
+    {
+        auto positions = make_positions(n_tok);
+        auto mask = make_perhead_uniform_mask(n_tok, n_head, 0.0f);
+
+        llama_set_attn_mask(ctx, mask.data(), positions.data(), n_tok, n_head, -1);
+        auto logits = eval_prompt(tctx, prompt);
+        float diff = logits_diff(logits_baseline, logits);
+        printf("  diff vs baseline: %.6e\n", diff);
+        if (diff < 1e-5f) {
+            pass("per-head uniform zeros identical to baseline (causal still applied)");
+        } else {
+            char buf[128]; snprintf(buf, sizeof(buf), "per-head zeros should match baseline (diff=%.6e)", diff);
+            fail(buf);
         }
     }
 

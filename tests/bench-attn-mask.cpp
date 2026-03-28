@@ -1,11 +1,13 @@
 // Benchmark for custom attention mask overhead
 // Usage: bench-attn-mask <model.gguf> [n_prompt] [n_iter]
 //
-// Measures decode time for 4 configurations:
+// Measures decode time for 6 configurations:
 //   A) No custom mask (baseline)
 //   B) Custom mask = nullptr (check overhead)
 //   C) Dense causal mask (full n_pos*n_pos, all 0.0 = same as causal)
 //   D) Sparse window mask (window=2, restrictive)
+//   E) Per-head zeros (n_head_groups=n_head, all 0.0)
+//   F) Per-head window (n_head_groups=n_head, window varies per head)
 //
 // Reports: avg ms/decode, overhead vs baseline
 
@@ -138,26 +140,47 @@ int main(int argc, char ** argv) {
     printf("n_iter:   %d\n", n_iter);
     printf("\n");
 
+    const int n_head = llama_model_n_head(model);
+    printf("n_head:   %d\n", n_head);
+
     auto positions = make_positions(n_tokens);
     auto mask_zeros  = make_zeros_mask(n_tokens);
     auto mask_window = make_window_mask(n_tokens, 2);
+
+    // Per-head masks
+    auto mask_perhead_zeros = std::vector<float>(n_head * n_tokens * n_tokens, 0.0f);
+
+    // Per-head varying window: head h gets window = 1 + h*(n_tokens-1)/(n_head-1)
+    std::vector<float> mask_perhead_window(n_head * n_tokens * n_tokens);
+    for (int h = 0; h < n_head; ++h) {
+        int window = (n_head > 1) ? 1 + h * (n_tokens - 1) / (n_head - 1) : 1;
+        for (int i = 0; i < n_tokens; ++i) {
+            for (int j = 0; j < n_tokens; ++j) {
+                float val = (j <= i && (i - j) <= window) ? 0.0f : -INFINITY;
+                mask_perhead_window[h * n_tokens * n_tokens + i * n_tokens + j] = val;
+            }
+        }
+    }
 
     struct config {
         const char * name;
         const float * mask;
         const llama_pos * pos;
         int32_t n_pos;
+        int32_t n_head_groups;
     };
 
     config configs[] = {
-        { "A) No mask (baseline)",  nullptr,            nullptr,          0        },
-        { "B) nullptr mask",        nullptr,            nullptr,          0        },
-        { "C) Dense zeros mask",    mask_zeros.data(),  positions.data(), n_tokens },
-        { "D) Window=2 mask",       mask_window.data(), positions.data(), n_tokens },
+        { "A) No mask (baseline)",    nullptr,                   nullptr,          0,        0      },
+        { "B) nullptr mask",          nullptr,                   nullptr,          0,        0      },
+        { "C) Dense zeros mask",      mask_zeros.data(),         positions.data(), n_tokens, 0      },
+        { "D) Window=2 mask",         mask_window.data(),        positions.data(), n_tokens, 0      },
+        { "E) Per-head zeros",        mask_perhead_zeros.data(), positions.data(), n_tokens, n_head },
+        { "F) Per-head window",       mask_perhead_window.data(),positions.data(), n_tokens, n_head },
     };
 
     const int n_configs = sizeof(configs) / sizeof(configs[0]);
-    bench_result results[4];
+    bench_result results[6];
 
     // Warmup: 2 decodes to compile Metal/CUDA kernels
     printf("Warming up...\n");
@@ -171,7 +194,7 @@ int main(int argc, char ** argv) {
         results[c].name = configs[c].name;
 
         for (int i = 0; i < n_iter; ++i) {
-            llama_set_attn_mask(ctx, configs[c].mask, configs[c].pos, configs[c].n_pos, 0, -1);
+            llama_set_attn_mask(ctx, configs[c].mask, configs[c].pos, configs[c].n_pos, configs[c].n_head_groups, -1);
             double t = run_decode(ctx, tok_buf.data(), n_tokens);
             if (t < 0.0) {
                 fprintf(stderr, "Decode failed for config %s iter %d\n", configs[c].name, i);
