@@ -110,6 +110,9 @@ struct llama_context {
     void set_attn_mask(const float * mask, const llama_pos * positions, int32_t n_pos,
                        int32_t n_head_groups, int32_t slot_id);
 
+    // external state bias — additive kq bias from SelfMetrics (Phase 5)
+    void set_state_bias(const float * data, int32_t n_head, int32_t n_kv);
+
     // per-slot mask data
     struct attn_mask_data {
         std::vector<float>     mask;       // [n_head_groups * n_pos * n_pos]
@@ -346,6 +349,19 @@ private:
     attn_mask_data                                  attn_mask_global; // slot_id = -1
     std::unordered_map<int32_t, attn_mask_data>     attn_mask_slots;  // slot_id >= 0
     static const attn_mask_data                     attn_mask_empty;  // sentinel for empty lookups
+
+    // state_kq_b — external attention bias from SelfMetrics (Phase 5)
+    // Applied additively to kq scores in build_attn_mha, combined with model's own kq_b.
+    // Layout: [n_head, n_kv] flattened row-major. Broadcast across query tokens.
+    struct state_bias_data {
+        std::vector<float> bias;    // [n_head * n_kv]
+        int32_t n_head = 0;
+        int32_t n_kv   = 0;
+        bool empty() const { return bias.empty(); }
+    };
+    state_bias_data state_bias;
+
+    const state_bias_data & get_state_bias() const { return state_bias; }
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

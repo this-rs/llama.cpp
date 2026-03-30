@@ -9,6 +9,7 @@
 #include "llama-model.h"
 #include "llama-ext.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -1092,6 +1093,20 @@ void llama_context::set_attn_mask(const float * mask, const llama_pos * position
         LLAMA_LOG_DEBUG("%s: custom attention mask set for %d positions, %d head groups (slot %d)\n",
                         __func__, n_pos, slot_mask.n_head_groups, slot_id);
     }
+}
+
+void llama_context::set_state_bias(const float * data, int32_t n_head, int32_t n_kv) {
+    if (data == nullptr || n_head <= 0 || n_kv <= 0) {
+        state_bias = {};
+        LLAMA_LOG_DEBUG("%s: state bias cleared\n", __func__);
+        return;
+    }
+    const size_t n = (size_t)n_head * (size_t)n_kv;
+    state_bias.bias.assign(data, data + n);
+    state_bias.n_head = n_head;
+    state_bias.n_kv = n_kv;
+    LLAMA_LOG_DEBUG("%s: state bias set: n_head=%d, n_kv=%d, size=%zu\n",
+                    __func__, n_head, n_kv, n);
 }
 
 const llama_context::attn_mask_data & llama_context::get_attn_mask_for_slot(int32_t slot_id) const {
@@ -2240,6 +2255,9 @@ llm_graph_params llama_context::graph_params(
         /*.custom_attn_mask_n_pos        =*/ get_attn_mask_n_pos(),
         /*.custom_attn_mask_n_head_groups=*/ get_attn_mask_n_head_groups(),
         /*.custom_attn_mask_sorted_pos   =*/ get_attn_mask_sorted_pos(),
+        /*.state_bias_data   =*/ state_bias.empty() ? nullptr : state_bias.bias.data(),
+        /*.state_bias_n_head =*/ state_bias.n_head,
+        /*.state_bias_n_kv   =*/ state_bias.n_kv,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
@@ -3170,6 +3188,10 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
 void llama_set_attn_mask(llama_context * ctx, const float * mask, const llama_pos * positions, int32_t n_pos,
                          int32_t n_head_groups, int32_t slot_id) {
     ctx->set_attn_mask(mask, positions, n_pos, n_head_groups, slot_id);
+}
+
+void llama_set_state_bias(llama_context * ctx, const float * data, int32_t n_head, int32_t n_kv) {
+    ctx->set_state_bias(data, n_head, n_kv);
 }
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {

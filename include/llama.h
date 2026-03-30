@@ -991,6 +991,17 @@ extern "C" {
             int32_t                n_head_groups,
             int32_t                slot_id);
 
+    // Set an external attention bias (state_kq_b) added to kq scores before softmax.
+    // Layout: [n_head * n_kv] row-major (head-major). Broadcast across all query tokens.
+    // Combined additively with the model's own kq_b (ALiBi etc.) if present.
+    // Pass NULL data to clear the bias.
+    // The data is copied internally — the caller can free their buffer after this call.
+    LLAMA_API void llama_set_state_bias(
+            struct llama_context * ctx,
+            const float          * data,
+            int32_t                n_head,
+            int32_t                n_kv);
+
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);
