@@ -435,6 +435,23 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn,
                             custom_attn_mask, custom_attn_mask_pos, custom_attn_mask_n_pos,
                             custom_attn_mask_n_head_groups, custom_attn_mask_sorted_pos);
+
+    // Phase 5: fill state_kq_b tensor with external bias data (now that backend has allocated memory)
+    if (state_kq_b != nullptr && state_bias_data != nullptr) {
+        const int64_t n_kv   = state_kq_b->ne[0];
+        const int64_t n_head = state_kq_b->ne[2];
+
+        // Zero the entire tensor first (handles padding for state_bias_n_kv < n_kv)
+        memset(state_kq_b->data, 0, ggml_nbytes(state_kq_b));
+
+        // Copy per-head rows from the bias data
+        for (int h = 0; h < state_bias_n_head && h < n_head; h++) {
+            memcpy(
+                (float *)state_kq_b->data + h * n_kv,
+                state_bias_data + h * state_bias_n_kv,
+                (size_t)state_bias_n_kv * sizeof(float));
+        }
+    }
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -449,6 +466,11 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     this->custom_attn_mask_n_head_groups = params.custom_attn_mask_n_head_groups;
     this->custom_attn_mask_sorted_pos   = params.custom_attn_mask_sorted_pos;
 
+    // update state bias pointers (may change between decodes)
+    this->state_bias_data   = params.state_bias_data;
+    this->state_bias_n_head = params.state_bias_n_head;
+    this->state_bias_n_kv   = params.state_bias_n_kv;
+
     bool res = true;
 
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
@@ -456,6 +478,11 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams,
                               custom_attn_mask_n_head_groups);
+
+    // state_kq_b tensor dimensions must match — if bias appeared/disappeared, can't reuse graph
+    if ((state_kq_b != nullptr) != (params.state_bias_data != nullptr)) {
+        res = false;
+    }
 
     return res;
 }
@@ -910,6 +937,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     custom_attn_mask_n_pos        (params.custom_attn_mask_n_pos),
     custom_attn_mask_n_head_groups(params.custom_attn_mask_n_head_groups),
     custom_attn_mask_sorted_pos   (params.custom_attn_mask_sorted_pos),
+    state_bias_data   (params.state_bias_data),
+    state_bias_n_head (params.state_bias_n_head),
+    state_bias_n_kv   (params.state_bias_n_kv),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1820,7 +1850,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * ext_state_kq_b) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -1909,6 +1940,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         if (kq_b) {
             kq = ggml_add(ctx0, kq, kq_b);
             cb(kq, "kq_plus_kq_b", il);
+        }
+
+        // Phase 5: Apply external state bias from SelfMetrics.
+        // ext_state_kq_b is pre-created in build_attn_inp_kv() and filled in set_input().
+        // Layout: [n_kv, 1, n_head] — broadcasts over n_tokens via ggml_add.
+        if (ext_state_kq_b != nullptr) {
+            kq = ggml_add(ctx0, kq, ext_state_kq_b);
+            cb(kq, "kq_plus_state_bias", il);
         }
 
         kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
@@ -2060,6 +2099,26 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     inp->custom_attn_mask_n_head_groups = custom_attn_mask_n_head_groups;
     inp->custom_attn_mask_sorted_pos   = custom_attn_mask_sorted_pos;
 
+    // Phase 5: create state_kq_b tensor if external state bias is provided
+    // The tensor is created here (build time) but filled in set_input() (after backend allocation)
+    if (state_bias_data != nullptr && state_bias_n_head > 0 && state_bias_n_kv > 0) {
+        const auto * mctx_cur_kv = static_cast<const llama_kv_cache_context *>(mctx);
+        const int64_t n_kv = mctx_cur_kv->get_n_kv();
+        const int64_t n_head = hparams.n_head();
+
+        // Create tensor with full KV size (padded with zeros for state_bias_n_kv < n_kv)
+        inp->state_kq_b = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_kv, 1, n_head);
+        ggml_set_input(inp->state_kq_b);
+        ggml_set_name(inp->state_kq_b, "state_kq_b");
+
+        inp->state_bias_data   = state_bias_data;
+        inp->state_bias_n_head = state_bias_n_head;
+        inp->state_bias_n_kv   = state_bias_n_kv;
+
+        // Store tensor on context so build_attn_mha() can reference it
+        state_kq_b_tensor = inp->state_kq_b;
+    }
+
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
 
@@ -2101,7 +2160,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, inp->state_kq_b);
     cb(cur, "kqv_out", il);
 
     if (wo) {
