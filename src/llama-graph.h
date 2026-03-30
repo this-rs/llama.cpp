@@ -566,6 +566,11 @@ struct llm_graph_params {
     int32_t           custom_attn_mask_n_head_groups = 1;
     const std::pair<llama_pos, int32_t> * custom_attn_mask_sorted_pos = nullptr;
 
+    // external state bias (optional, borrowed pointer — must outlive the graph)
+    const float * state_bias_data   = nullptr;
+    int32_t       state_bias_n_head = 0;
+    int32_t       state_bias_n_kv   = 0;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -780,6 +785,12 @@ struct llm_graph_context {
     int32_t           custom_attn_mask_n_pos        = 0;
     int32_t           custom_attn_mask_n_head_groups = 1;
     const std::pair<llama_pos, int32_t> * custom_attn_mask_sorted_pos = nullptr;
+
+    // external state bias — borrowed from llama_context::state_bias (Phase 5)
+    // Layout: [n_head * n_kv] row-major. Added to kq before softmax.
+    const float * state_bias_data   = nullptr;
+    int32_t       state_bias_n_head = 0;
+    int32_t       state_bias_n_kv   = 0;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

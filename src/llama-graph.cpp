@@ -910,6 +910,9 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     custom_attn_mask_n_pos        (params.custom_attn_mask_n_pos),
     custom_attn_mask_n_head_groups(params.custom_attn_mask_n_head_groups),
     custom_attn_mask_sorted_pos   (params.custom_attn_mask_sorted_pos),
+    state_bias_data   (params.state_bias_data),
+    state_bias_n_head (params.state_bias_n_head),
+    state_bias_n_kv   (params.state_bias_n_kv),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1909,6 +1912,49 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         if (kq_b) {
             kq = ggml_add(ctx0, kq, kq_b);
             cb(kq, "kq_plus_kq_b", il);
+        }
+
+        // Phase 5: Apply external state bias from SelfMetrics.
+        // state_bias layout: [n_head, n_kv] → create tensor and broadcast across n_tokens.
+        // kq shape after permute+mul_mat: [n_kv, n_tokens, n_head, n_stream]
+        if (state_bias_data != nullptr && state_bias_n_head > 0 && state_bias_n_kv > 0) {
+            const int64_t n_kv_kq     = kq->ne[0]; // n_kv
+            const int64_t n_head_kq   = kq->ne[2]; // n_head
+
+            // Only apply if dimensions are compatible
+            if (state_bias_n_kv <= n_kv_kq && state_bias_n_head <= n_head_kq) {
+                // Create a 3D tensor [n_kv, 1, n_head] that broadcasts over n_tokens
+                ggml_tensor * sb = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32,
+                    state_bias_n_kv, 1, state_bias_n_head);
+                ggml_set_input(sb);
+                ggml_set_name(sb, "state_kq_b");
+
+                // Copy bias data into the tensor
+                memcpy(sb->data, state_bias_data,
+                    (size_t)state_bias_n_head * (size_t)state_bias_n_kv * sizeof(float));
+
+                // If state_bias_n_kv < n_kv_kq, pad with zeros via a view
+                ggml_tensor * sb_expanded = sb;
+                if (state_bias_n_kv < n_kv_kq) {
+                    sb_expanded = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32,
+                        n_kv_kq, 1, n_head_kq);
+                    ggml_set_input(sb_expanded);
+                    ggml_set_name(sb_expanded, "state_kq_b_pad");
+                    memset(sb_expanded->data, 0,
+                        (size_t)n_head_kq * (size_t)n_kv_kq * sizeof(float));
+                    // Copy per-head rows
+                    for (int h = 0; h < state_bias_n_head && h < n_head_kq; h++) {
+                        memcpy(
+                            (float*)sb_expanded->data + h * n_kv_kq,
+                            state_bias_data + h * state_bias_n_kv,
+                            (size_t)state_bias_n_kv * sizeof(float));
+                    }
+                }
+
+                // ggml_add broadcasts dim 1: [n_kv, 1, n_head] + [n_kv, n_tokens, n_head]
+                kq = ggml_add(ctx0, kq, sb_expanded);
+                cb(kq, "kq_plus_state_bias", il);
+            }
         }
 
         kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
