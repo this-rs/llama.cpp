@@ -333,6 +333,12 @@ public:
     int32_t           custom_attn_mask_n_pos        = 0;
     int32_t           custom_attn_mask_n_head_groups = 1;
     const std::pair<llama_pos, int32_t> * custom_attn_mask_sorted_pos = nullptr;
+
+    // external state bias (Phase 5) — tensor created during build, filled during set_input
+    ggml_tensor * state_kq_b          = nullptr; // F32 [n_kv, 1, n_head] or nullptr
+    const float * state_bias_data     = nullptr; // borrowed pointer to bias data
+    int32_t       state_bias_n_head   = 0;
+    int32_t       state_bias_n_kv     = 0;
 };
 
 // V-less input for the KV cache
@@ -792,6 +798,10 @@ struct llm_graph_context {
     int32_t       state_bias_n_head = 0;
     int32_t       state_bias_n_kv   = 0;
 
+    // Tensor created during build_attn_inp_kv(), filled during set_input().
+    // Used by build_attn_mha() to apply the bias. Mutable because set in build_attn_inp_kv().
+    mutable ggml_tensor * state_kq_b_tensor = nullptr;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
@@ -924,7 +934,8 @@ struct llm_graph_context {
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * ext_state_kq_b = nullptr) const;  // Phase 5: external state bias (pre-allocated, filled in set_input)
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
