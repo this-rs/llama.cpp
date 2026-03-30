@@ -134,14 +134,36 @@ static std::vector<float> make_perhead_uniform_mask(int n, int n_heads, float va
     return std::vector<float>(n_heads * n * n, val);
 }
 
+static ggml_type parse_ggml_type(const char * s) {
+    if (strcmp(s, "f16")  == 0) return GGML_TYPE_F16;
+    if (strcmp(s, "q8_0") == 0) return GGML_TYPE_Q8_0;
+    if (strcmp(s, "q5_0") == 0) return GGML_TYPE_Q5_0;
+    if (strcmp(s, "q5_1") == 0) return GGML_TYPE_Q5_1;
+    if (strcmp(s, "q4_0") == 0) return GGML_TYPE_Q4_0;
+    if (strcmp(s, "q4_1") == 0) return GGML_TYPE_Q4_1;
+    return GGML_TYPE_F16;
+}
+
 int main(int argc, char ** argv) {
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <model.gguf>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <model.gguf> [-ctk type] [-ctv type]\n", argv[0]);
         return 1;
     }
 
     const char * model_path = argv[1];
     const char * prompt = "The capital of France is";
+
+    // parse optional -ctk / -ctv
+    ggml_type type_k = GGML_TYPE_F16;
+    ggml_type type_v = GGML_TYPE_F16;
+    for (int i = 2; i < argc - 1; i++) {
+        if (strcmp(argv[i], "-ctk") == 0) { type_k = parse_ggml_type(argv[++i]); }
+        if (strcmp(argv[i], "-ctv") == 0) { type_v = parse_ggml_type(argv[++i]); }
+    }
+
+    if (type_k != GGML_TYPE_F16 || type_v != GGML_TYPE_F16) {
+        fprintf(stderr, "KV cache types: K=%d V=%d (rotation will be enabled if quantized)\n", type_k, type_v);
+    }
 
     // load model
     llama_model_params mparams = llama_model_default_params();
@@ -155,6 +177,8 @@ int main(int argc, char ** argv) {
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx   = 128;
     cparams.n_batch = 128;
+    cparams.type_k  = type_k;
+    cparams.type_v  = type_v;
 
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (!ctx) {
@@ -502,6 +526,92 @@ int main(int argc, char ** argv) {
             char buf[128]; snprintf(buf, sizeof(buf), "per-head zeros should match baseline (diff=%.6e)", diff);
             fail(buf);
         }
+    }
+
+    // === Test 14: State bias — non-zero bias should change output ===
+    printf("\n=== Test 14: State bias (uniform positive bias) ===\n");
+    {
+        // Create a non-uniform bias: strong positive for position 0, zero elsewhere
+        // This breaks the uniform symmetry so softmax distribution actually shifts
+        const int32_t n_kv_bias = n_tok;
+        std::vector<float> bias_data(n_head * n_kv_bias, 0.0f);
+        for (int h = 0; h < n_head; h++) {
+            bias_data[h * n_kv_bias + 0] = 10.0f; // strongly boost position 0 attention
+        }
+
+        llama_set_state_bias(ctx, bias_data.data(), n_head, n_kv_bias);
+        auto logits_biased = eval_prompt(tctx, prompt);
+        float diff = logits_diff(logits_baseline, logits_biased);
+        printf("  bias(pos0=+10) vs baseline: %.6e\n", diff);
+
+        if (diff > 1e-4f) {
+            char buf[128]; snprintf(buf, sizeof(buf),
+                "state bias changes output (diff=%.3e)", diff);
+            pass(buf);
+        } else {
+            char buf[128]; snprintf(buf, sizeof(buf),
+                "state bias should change output (diff=%.6e)", diff);
+            fail(buf);
+        }
+
+        // Clear bias
+        llama_set_state_bias(ctx, nullptr, 0, 0);
+    }
+
+    // === Test 15: State bias clear restores baseline ===
+    printf("\n=== Test 15: State bias clear restores baseline ===\n");
+    {
+        llama_set_state_bias(ctx, nullptr, 0, 0);
+        auto logits = eval_prompt(tctx, prompt);
+        float diff = logits_diff(logits_baseline, logits);
+        printf("  diff vs baseline after clear: %.6e\n", diff);
+        if (diff < 1e-5f) {
+            pass("state bias clear restores baseline");
+        } else {
+            char buf[128]; snprintf(buf, sizeof(buf),
+                "state bias clear should restore baseline (diff=%.6e)", diff);
+            fail(buf);
+        }
+    }
+
+    // === Test 16: State bias + custom mask combined ===
+    printf("\n=== Test 16: State bias + custom mask combined ===\n");
+    {
+        auto positions = make_positions(n_tok);
+        auto mask = make_window_mask(n_tok, 2);
+        llama_set_attn_mask(ctx, mask.data(), positions.data(), n_tok, 0, -1);
+
+        const int32_t n_kv_bias = n_tok;
+        std::vector<float> bias_data(n_head * n_kv_bias, 0.5f);
+        llama_set_state_bias(ctx, bias_data.data(), n_head, n_kv_bias);
+
+        auto logits_combined = eval_prompt(tctx, prompt);
+
+        // Should differ from baseline (both mask and bias active)
+        float diff_base = logits_diff(logits_baseline, logits_combined);
+
+        // Get mask-only result for comparison
+        llama_set_state_bias(ctx, nullptr, 0, 0);
+        auto logits_mask_only = eval_prompt(tctx, prompt);
+        float diff_mask_bias = logits_diff(logits_mask_only, logits_combined);
+
+        printf("  combined vs baseline:   %.6e\n", diff_base);
+        printf("  combined vs mask-only:  %.6e\n", diff_mask_bias);
+
+        bool ok = true;
+        if (diff_base <= 0.1f) {
+            fail("combined should differ from baseline"); ok = false;
+        }
+        if (diff_mask_bias <= 1e-4f) {
+            fail("adding bias should differ from mask-only"); ok = false;
+        }
+        if (ok) {
+            pass("state bias + custom mask combined produces distinct output");
+        }
+
+        // Clear both
+        llama_set_attn_mask(ctx, nullptr, nullptr, 0, 0, -1);
+        llama_set_state_bias(ctx, nullptr, 0, 0);
     }
 
     // Clear mask for clean exit
