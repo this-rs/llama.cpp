@@ -1916,9 +1916,45 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     ggml_tensor * cur;
 
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && ext_state_kq_b == nullptr;
+    // Flash attention is used when enabled AND no model-level kq_b (ALiBi-style bias).
+    // ext_state_kq_b (Obrain state bias) is now supported in flash path by fusing into the mask.
+    const bool v_is_quantized = ggml_is_quantized(v->type);
+    const bool use_flash_attn = cparams.flash_attn &&
+        (v_is_quantized || kq_b == nullptr);
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
+
+        // Fuse ext_state_kq_b into kq_mask for flash attention compatibility.
+        // Both are additive on Q·K^T logits before softmax, so: mask' = mask + bias.
+        // This avoids the non-flash fallback which cannot handle quantized V.
+        if (ext_state_kq_b != nullptr) {
+            // kq_mask:        [n_kv, n_tokens, nhg, n_stream]  (F16 for flash)
+            // ext_state_kq_b: [n_kv, 1,        n_head]         (F32)
+            // Strategy: cast mask→F32, expand nhg→n_head if needed, add bias, cast→F16.
+
+            const int64_t nhg         = kq_mask->ne[2];
+            const int64_t n_head_bias = ext_state_kq_b->ne[2];
+
+            // Cast mask to F32 for precise addition
+            ggml_tensor * mask_f32 = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+
+            // If mask uses head-group broadcasting (nhg < n_head), expand to per-head
+            if (nhg < n_head_bias) {
+                ggml_tensor * expand_target = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32,
+                    mask_f32->ne[0], mask_f32->ne[1], n_head_bias, mask_f32->ne[3]);
+                mask_f32 = ggml_repeat(ctx0, mask_f32, expand_target);
+            }
+
+            // Reshape bias to 4d: [n_kv, 1, n_head, 1] — broadcasts over n_tokens (dim1) and n_stream (dim3)
+            ggml_tensor * bias_4d = ggml_reshape_4d(ctx0, ext_state_kq_b,
+                ext_state_kq_b->ne[0], ext_state_kq_b->ne[1], ext_state_kq_b->ne[2], 1);
+
+            mask_f32 = ggml_add(ctx0, mask_f32, bias_4d);
+            cb(mask_f32, "kq_mask_fused_state_bias", il);
+
+            // Cast back to F16 for flash attention kernel
+            kq_mask = ggml_cast(ctx0, mask_f32, GGML_TYPE_F16);
+        }
 
         if (v_trans) {
             v = ggml_transpose(ctx0, v);
