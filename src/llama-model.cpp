@@ -8891,6 +8891,82 @@ const char * llama_model_cls_label(const struct llama_model * model, uint32_t i)
     return nullptr;
 }
 
+int32_t llama_model_get_mean_token_embedding(
+        const llama_model * model,
+        const llama_token * tokens,
+        int32_t             n_tokens,
+        float             * output) {
+    if (!model || !tokens || !output || n_tokens <= 0) {
+        return -1;
+    }
+
+    const auto * tok_embd = model->tok_embd;
+    if (!tok_embd) {
+        return -1;
+    }
+
+    const int32_t n_embd  = model->hparams.n_embd;
+    const int32_t n_vocab = (int32_t)model->vocab.n_tokens();
+    const auto    type    = tok_embd->type;
+
+    // Compute the byte stride per row.
+    // For quantized types, ggml_type_size returns the block size in bytes and
+    // ggml_blck_size returns the number of elements per block. Rows are always
+    // aligned to block boundaries (n_embd is a multiple of blck_size).
+    const size_t blck_size  = ggml_blck_size(type);
+    const size_t type_size  = ggml_type_size(type);
+    const size_t row_bytes  = (n_embd / blck_size) * type_size;
+
+    // Raw buffer for one row (quantized or f32)
+    std::vector<uint8_t> raw(row_bytes);
+    // Dequantized row (only used when type != f32)
+    std::vector<float> row(n_embd);
+
+    // Get dequantization function (nullptr for f32)
+    const auto * traits = ggml_get_type_traits(type);
+    const bool is_f32 = (type == GGML_TYPE_F32);
+
+    // Zero output
+    memset(output, 0, n_embd * sizeof(float));
+
+    int32_t valid = 0;
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        const llama_token t = tokens[i];
+        if (t < 0 || t >= n_vocab) {
+            continue;
+        }
+
+        // Read raw bytes for row t from any backend (CPU, Metal, CUDA)
+        ggml_backend_tensor_get(tok_embd, raw.data(), t * row_bytes, row_bytes);
+
+        const float * src;
+        if (is_f32) {
+            src = reinterpret_cast<const float *>(raw.data());
+        } else {
+            // Dequantize to f32
+            traits->to_float(raw.data(), row.data(), n_embd);
+            src = row.data();
+        }
+
+        for (int32_t d = 0; d < n_embd; ++d) {
+            output[d] += src[d];
+        }
+        ++valid;
+    }
+
+    // Mean
+    if (valid > 1) {
+        const float inv = 1.0f / (float)valid;
+        for (int32_t d = 0; d < n_embd; ++d) {
+            output[d] *= inv;
+        }
+    } else if (valid == 0) {
+        return -1;
+    }
+
+    return n_embd;
+}
+
 // deprecated
 int32_t llama_n_ctx_train(const llama_model * model) {
     return llama_model_n_ctx_train(model);

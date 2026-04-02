@@ -565,6 +565,19 @@ extern "C" {
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
 
+    // Get the mean-pooled input embedding for a list of tokens.
+    // Reads directly from the tok_embd weight matrix (no forward pass).
+    // `tokens`: array of token IDs.
+    // `n_tokens`: number of tokens.
+    // `output`: pre-allocated float buffer of size n_embd.
+    // Returns n_embd on success, -1 on failure (null model/tensor, n_tokens==0).
+    // The output is the element-wise mean of the input embeddings for each token.
+    LLAMA_API int32_t llama_model_get_mean_token_embedding(
+        const struct llama_model * model,
+        const llama_token * tokens,
+        int32_t             n_tokens,
+        float             * output);
+
     // Returns the number of classifier outputs (only valid for classifier models)
     // Undefined behavior for non-classifier models
     LLAMA_API uint32_t llama_model_n_cls_out(const struct llama_model * model);
