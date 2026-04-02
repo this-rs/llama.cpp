@@ -74,6 +74,7 @@ struct llama_cross {
 };
 
 struct llm_graph_params;
+struct llama_attn_mask_hierarchical; // forward declaration for H7 BSR mask
 
 //
 // llm_graph_input
@@ -292,7 +293,8 @@ public:
             const llama_pos * custom_attn_mask_pos = nullptr,
             int32_t custom_attn_mask_n_pos = 0,
             int32_t custom_attn_mask_n_head_groups = 1,
-            const std::pair<llama_pos, int32_t> * custom_attn_mask_sorted_pos = nullptr) :
+            const std::pair<llama_pos, int32_t> * custom_attn_mask_sorted_pos = nullptr,
+            const llama_attn_mask_hierarchical * hier_mask = nullptr) :
         hparams(hparams),
         cparams(cparams),
         mctx(mctx),
@@ -300,7 +302,8 @@ public:
         custom_attn_mask_pos(custom_attn_mask_pos),
         custom_attn_mask_n_pos(custom_attn_mask_n_pos),
         custom_attn_mask_n_head_groups(custom_attn_mask_n_head_groups),
-        custom_attn_mask_sorted_pos(custom_attn_mask_sorted_pos) {
+        custom_attn_mask_sorted_pos(custom_attn_mask_sorted_pos),
+        hier_mask(hier_mask) {
     }
     ~llm_graph_input_attn_kv() = default;
 
@@ -333,6 +336,9 @@ public:
     int32_t           custom_attn_mask_n_pos        = 0;
     int32_t           custom_attn_mask_n_head_groups = 1;
     const std::pair<llama_pos, int32_t> * custom_attn_mask_sorted_pos = nullptr;
+
+    // hierarchical bank-level mask (H7 — BSR sparse, optional)
+    const llama_attn_mask_hierarchical * hier_mask = nullptr;
 
     // external state bias (Phase 5) — tensor created during build, filled during set_input
     ggml_tensor * state_kq_b          = nullptr; // F32 [n_kv, 1, n_head] or nullptr
@@ -419,6 +425,9 @@ public:
     int32_t           custom_attn_mask_n_pos        = 0;
     int32_t           custom_attn_mask_n_head_groups = 1;
     const std::pair<llama_pos, int32_t> * custom_attn_mask_sorted_pos = nullptr;
+
+    // hierarchical bank-level mask (H7 — BSR sparse, optional)
+    const llama_attn_mask_hierarchical * hier_mask = nullptr;
 };
 
 class llm_graph_input_attn_cross : public llm_graph_input_i {
@@ -571,6 +580,9 @@ struct llm_graph_params {
     int32_t           custom_attn_mask_n_pos        = 0;
     int32_t           custom_attn_mask_n_head_groups = 1;
     const std::pair<llama_pos, int32_t> * custom_attn_mask_sorted_pos = nullptr;
+
+    // hierarchical bank-level mask (H7 — BSR sparse, optional)
+    const llama_attn_mask_hierarchical * hier_mask = nullptr;
 
     // external state bias (optional, borrowed pointer — must outlive the graph)
     const float * state_bias_data   = nullptr;
@@ -791,6 +803,9 @@ struct llm_graph_context {
     int32_t           custom_attn_mask_n_pos        = 0;
     int32_t           custom_attn_mask_n_head_groups = 1;
     const std::pair<llama_pos, int32_t> * custom_attn_mask_sorted_pos = nullptr;
+
+    // hierarchical bank-level mask (H7 — BSR sparse, optional)
+    const llama_attn_mask_hierarchical * hier_mask = nullptr;
 
     // external state bias — borrowed from llama_context::state_bias (Phase 5)
     // Layout: [n_head * n_kv] row-major. Added to kq before softmax.

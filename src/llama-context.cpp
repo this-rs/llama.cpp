@@ -1109,6 +1109,85 @@ void llama_context::set_state_bias(const float * data, int32_t n_head, int32_t n
                     __func__, n_head, n_kv, n);
 }
 
+void llama_context::set_attn_mask_hierarchical(
+        const float   * intra_blocks,
+        const int32_t * intra_offsets,
+        const float   * inter_values,
+        const int32_t * bank_sizes,
+        const llama_pos * bank_positions,
+        int32_t n_banks,
+        int32_t n_groups,
+        int32_t slot_id) {
+
+    if (intra_blocks == nullptr || n_banks <= 0) {
+        if (slot_id < 0) {
+            hier_mask_global = {};
+            hier_mask_slots.clear();
+            LLAMA_LOG_DEBUG("%s: hierarchical mask cleared (all slots)\n", __func__);
+        } else {
+            hier_mask_slots.erase(slot_id);
+            LLAMA_LOG_DEBUG("%s: hierarchical mask cleared for slot %d\n", __func__, slot_id);
+        }
+        return;
+    }
+
+    auto build = [&](llama_attn_mask_hierarchical & hm) {
+        hm.n_banks  = n_banks;
+        hm.n_groups = n_groups;
+
+        // copy bank_sizes and compute total positions + offsets
+        hm.bank_sizes.assign(bank_sizes, bank_sizes + n_banks);
+        hm.bank_pos_offsets.resize(n_banks + 1);
+        hm.bank_pos_offsets[0] = 0;
+        int32_t total_pos = 0;
+        for (int32_t b = 0; b < n_banks; b++) {
+            total_pos += bank_sizes[b];
+            hm.bank_pos_offsets[b + 1] = total_pos;
+        }
+        hm.n_pos_total = total_pos;
+
+        // copy intra_offsets [n_banks + 1]
+        hm.intra_offsets.assign(intra_offsets, intra_offsets + n_banks + 1);
+
+        // copy intra_blocks — total size = intra_offsets[n_banks]
+        const int32_t intra_total = intra_offsets[n_banks];
+        hm.intra_blocks.assign(intra_blocks, intra_blocks + intra_total);
+
+        // copy inter_values [n_groups * n_banks * n_banks]
+        const size_t inter_size = (size_t)n_groups * n_banks * n_banks;
+        hm.inter_values.assign(inter_values, inter_values + inter_size);
+
+        // copy bank_positions [total_pos]
+        hm.bank_positions.assign(bank_positions, bank_positions + total_pos);
+
+        // build pos → (bank, local) lookup
+        hm.build_lookup();
+
+        LLAMA_LOG_DEBUG("%s: hierarchical mask set: %d banks, %d groups, %d total positions, "
+                        "intra=%.1fKB, inter=%.1fKB\n",
+                        __func__, n_banks, n_groups, total_pos,
+                        (float)intra_total * sizeof(float) / 1024.0f,
+                        (float)inter_size * sizeof(float) / 1024.0f);
+    };
+
+    if (slot_id < 0) {
+        build(hier_mask_global);
+    } else {
+        build(hier_mask_slots[slot_id]);
+    }
+}
+
+const llama_attn_mask_hierarchical & llama_context::get_hier_mask_for_slot(int32_t slot_id) const {
+    static const llama_attn_mask_hierarchical hier_mask_empty;
+    if (slot_id >= 0) {
+        auto it = hier_mask_slots.find(slot_id);
+        if (it != hier_mask_slots.end()) {
+            return it->second;
+        }
+    }
+    return hier_mask_global.empty() ? hier_mask_empty : hier_mask_global;
+}
+
 const llama_context::attn_mask_data & llama_context::get_attn_mask_for_slot(int32_t slot_id) const {
     if (slot_id >= 0) {
         auto it = attn_mask_slots.find(slot_id);
@@ -2255,6 +2334,7 @@ llm_graph_params llama_context::graph_params(
         /*.custom_attn_mask_n_pos        =*/ get_attn_mask_n_pos(),
         /*.custom_attn_mask_n_head_groups=*/ get_attn_mask_n_head_groups(),
         /*.custom_attn_mask_sorted_pos   =*/ get_attn_mask_sorted_pos(),
+        /*.hier_mask                     =*/ hier_mask_global.empty() ? nullptr : &hier_mask_global,
         /*.state_bias_data   =*/ state_bias.empty() ? nullptr : state_bias.bias.data(),
         /*.state_bias_n_head =*/ state_bias.n_head,
         /*.state_bias_n_kv   =*/ state_bias.n_kv,
@@ -3188,6 +3268,19 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
 void llama_set_attn_mask(llama_context * ctx, const float * mask, const llama_pos * positions, int32_t n_pos,
                          int32_t n_head_groups, int32_t slot_id) {
     ctx->set_attn_mask(mask, positions, n_pos, n_head_groups, slot_id);
+}
+
+void llama_set_attn_mask_hierarchical(llama_context * ctx,
+        const float   * intra_blocks,
+        const int32_t * intra_offsets,
+        const float   * inter_values,
+        const int32_t * bank_sizes,
+        const llama_pos * bank_positions,
+        int32_t n_banks,
+        int32_t n_groups,
+        int32_t slot_id) {
+    ctx->set_attn_mask_hierarchical(intra_blocks, intra_offsets, inter_values,
+                                     bank_sizes, bank_positions, n_banks, n_groups, slot_id);
 }
 
 void llama_set_state_bias(llama_context * ctx, const float * data, int32_t n_head, int32_t n_kv) {

@@ -26,7 +26,7 @@ extern float g_innerq_scale_inv_host[INNERQ_MAX_CHANNELS];
 extern bool turbo_innerq_needs_tensor_update(void);
 extern void turbo_innerq_mark_tensor_updated(void);
 #else
-static bool  g_innerq_finalized = false;
+[[maybe_unused]] static bool  g_innerq_finalized = false;
 static float g_innerq_scale_inv_host[INNERQ_MAX_CHANNELS] = {};
 static bool turbo_innerq_needs_tensor_update(void) { return false; }
 static void turbo_innerq_mark_tensor_updated(void) {}
@@ -1663,7 +1663,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn,
                                        const float * custom_mask, const llama_pos * custom_mask_pos, int32_t custom_mask_n_pos,
                                        int32_t custom_mask_n_head_groups,
-                                       const std::pair<llama_pos, int32_t> * custom_mask_sorted_pos) const {
+                                       const std::pair<llama_pos, int32_t> * custom_mask_sorted_pos,
+                                       const llama_attn_mask_hierarchical * hier_mask) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
@@ -1713,28 +1714,39 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         }
     }
 
-    // post-pass: overlay custom attention mask (AND logic)
-    // the custom mask can only RESTRICT attention, never open what the default mask blocks
-    if (custom_mask != nullptr && custom_mask_n_pos > 0) {
-        const int32_t nhg = (custom_mask_n_head_groups <= 1) ? 1 : custom_mask_n_head_groups;
+    // post-pass: overlay custom attention masks (AND logic — can only restrict, never open)
+    // Supports three modes, composable:
+    //   1. Dense custom mask only: flat n_pos² array (legacy path)
+    //   2. Hierarchical bank mask only (H7 BSR): ~160KB on-the-fly bank-aware lookup
+    //   3. Both: hierarchical graded values + dense topology blocking (AND between them)
+    const bool has_dense_mask = (custom_mask != nullptr && custom_mask_n_pos > 0);
+    const bool has_hier_mask  = (hier_mask != nullptr && !hier_mask->empty());
+
+    if (has_dense_mask || has_hier_mask) {
+        // Determine max head groups across both masks
+        int32_t nhg_dense = has_dense_mask ? ((custom_mask_n_head_groups <= 1) ? 1 : custom_mask_n_head_groups) : 0;
+        int32_t nhg_hier  = has_hier_mask  ? ((hier_mask->n_groups <= 1) ? 1 : hier_mask->n_groups) : 0;
+        const int32_t nhg = std::max(nhg_dense, nhg_hier);
+        if (nhg_dense == 0) nhg_dense = nhg; // broadcast: use same count
+        if (nhg_hier  == 0) nhg_hier  = nhg;
+
         const int64_t slice_size = n_kv * n_tps_dim; // elements per head-group slice
 
-        // helper: binary search in pre-sorted position array (zero allocation)
+        // helper: binary search in pre-sorted position array (for dense mode)
         auto find_pos_idx = [&](llama_pos p) -> int32_t {
+            if (!has_dense_mask) return -1;
             if (custom_mask_sorted_pos == nullptr) {
-                // fallback: linear scan (should not happen in normal use)
                 for (int32_t i = 0; i < custom_mask_n_pos; ++i) {
                     if (custom_mask_pos[i] == p) return i;
                 }
                 return -1;
             }
-            // binary search on sorted pairs
             const auto * begin = custom_mask_sorted_pos;
             const auto * end   = custom_mask_sorted_pos + custom_mask_n_pos;
             const auto target  = std::make_pair(p, INT32_MIN);
             const auto * it    = std::lower_bound(begin, end, target);
             if (it != end && it->first == p) {
-                return it->second; // original index
+                return it->second;
             }
             return -1;
         };
@@ -1744,38 +1756,57 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
                 const uint32_t i = s * n_tps + ii;
                 const llama_pos p_row = ubatch->pos[i];
 
-                // find the row index in the custom mask for this token's position
-                const int32_t cm_row = find_pos_idx(p_row);
-                if (cm_row < 0) {
-                    continue; // position not in custom mask → leave default
+                // check if row position exists in either mask
+                int32_t cm_row_dense = has_dense_mask ? find_pos_idx(p_row) : -1;
+                bool row_in_hier = has_hier_mask &&
+                    (hier_mask->pos_to_bank.find(p_row) != hier_mask->pos_to_bank.end());
+
+                if (cm_row_dense < 0 && !row_in_hier) {
+                    continue; // position not in any mask → leave default
                 }
 
-                // iterate KV cache cells and apply custom mask
                 for (uint32_t ss = 0; ss < v_cells.size(); ++ss) {
                     const auto & cells = v_cells[ss];
                     for (int64_t j = 0; j < n_kv; ++j) {
-                        if (cells.is_empty(j)) {
-                            continue;
-                        }
+                        if (cells.is_empty(j)) continue;
 
                         const llama_pos p_col = cells.pos_get(j);
-                        const int32_t cm_col = find_pos_idx(p_col);
-                        if (cm_col < 0) {
-                            continue; // KV position not in custom mask → leave default
-                        }
 
                         // apply to each head group
                         const int64_t n_groups_to_fill = (n_head_dim > 1) ? nhg : 1;
                         for (int64_t g = 0; g < n_groups_to_fill; ++g) {
-                            const float cm_val = custom_mask[g * custom_mask_n_pos * custom_mask_n_pos
-                                                             + cm_row * custom_mask_n_pos + cm_col];
+                            // Combine values from both masks (AND logic: take most restrictive)
+                            float cm_val = 0.0f; // neutral (no masking)
+
+                            // 1. Hierarchical graded values
+                            if (row_in_hier) {
+                                const int32_t g_hier = (int32_t)(g % nhg_hier);
+                                cm_val = std::min(cm_val, hier_mask->get_value(g_hier, p_row, p_col));
+                            }
+
+                            // 2. Dense topology/blocking values
+                            if (cm_row_dense >= 0) {
+                                const int32_t cm_col_dense = find_pos_idx(p_col);
+                                if (cm_col_dense >= 0) {
+                                    const int32_t g_dense = (int32_t)(g % nhg_dense);
+                                    const float dense_val = custom_mask[
+                                        g_dense * custom_mask_n_pos * custom_mask_n_pos
+                                        + cm_row_dense * custom_mask_n_pos + cm_col_dense];
+                                    cm_val = std::min(cm_val, dense_val);
+                                }
+                            }
+
+                            // Apply combined mask value
+                            // <= -1e9 → full block (-INFINITY)
+                            // in [-1e9, 0) → graded attenuation
+                            // == 0 → no change (neutral)
                             if (cm_val <= -1e9f) {
-                                // threshold check: any very large negative value means "block"
-                                // this handles both -INFINITY (from C API) and -1e30 (from JSON)
                                 const int64_t dst_idx = (s * n_head_dim + g) * slice_size + n_kv * ii + j;
                                 data[dst_idx] = -INFINITY;
+                            } else if (cm_val < 0.0f) {
+                                const int64_t dst_idx = (s * n_head_dim + g) * slice_size + n_kv * ii + j;
+                                data[dst_idx] = std::min(data[dst_idx], cm_val);
                             }
-                            // else: leave existing mask value (AND logic — custom can only restrict)
                         }
                     }
                 }
@@ -2087,8 +2118,6 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     // Iterate and write all the keys first, each row is a cell
     // Get whole range at a time
     for (const auto & layer : layers) {
-        const uint32_t il = layer.il;
-
         auto * k = layer.k_stream[cr.strm];
 
         // Use actual tensor width (may be padded for turbo types: e.g. 576→640)
@@ -2112,8 +2141,6 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 
     if (!v_trans) {
         for (const auto & layer : layers) {
-            const uint32_t il = layer.il;
-
             auto * v = layer.v_stream[cr.strm];
             if (!v) {
                 continue;
@@ -2618,9 +2645,10 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn,
                                                const float * custom_mask, const llama_pos * custom_mask_pos, int32_t custom_mask_n_pos,
                                                int32_t custom_mask_n_head_groups,
-                                               const std::pair<llama_pos, int32_t> * custom_mask_sorted_pos) const {
+                                               const std::pair<llama_pos, int32_t> * custom_mask_sorted_pos,
+                                               const llama_attn_mask_hierarchical * hier_mask) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn, custom_mask, custom_mask_pos, custom_mask_n_pos,
-                           custom_mask_n_head_groups, custom_mask_sorted_pos);
+                           custom_mask_n_head_groups, custom_mask_sorted_pos, hier_mask);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

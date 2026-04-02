@@ -991,6 +991,31 @@ extern "C" {
             int32_t                n_head_groups,
             int32_t                slot_id);
 
+    // Set a hierarchical (bank-level) attention mask.
+    // Instead of passing a dense [n_groups × n_pos × n_pos] mask, pass compact intra-bank
+    // blocks + inter-bank constants. Expanded on-the-fly during set_input_kq_mask.
+    //
+    // Memory: ~160KB vs ~1.1GB for dense expansion at 131K context.
+    //
+    // intra_blocks:  concatenated dense blocks [n_groups × chunk_i × chunk_i] per bank
+    // intra_offsets: [n_banks] byte offset into intra_blocks for each bank (in floats)
+    // inter_values:  [n_groups × n_banks × n_banks] constant cross-bank mask
+    // bank_sizes:    [n_banks] number of positions per bank
+    // bank_positions: all positions grouped by bank (bank 0 positions, then bank 1, ...)
+    // n_banks, n_groups: dimensions
+    //
+    // Pass NULL intra_blocks to clear.
+    LLAMA_API void llama_set_attn_mask_hierarchical(
+            struct llama_context * ctx,
+            const float          * intra_blocks,
+            const int32_t        * intra_offsets,
+            const float          * inter_values,
+            const int32_t        * bank_sizes,
+            const llama_pos      * bank_positions,
+            int32_t                n_banks,
+            int32_t                n_groups,
+            int32_t                slot_id);
+
     // Set an external attention bias (state_kq_b) added to kq scores before softmax.
     // Layout: [n_head * n_kv] row-major (head-major). Broadcast across all query tokens.
     // Combined additively with the model's own kq_b (ALiBi etc.) if present.
