@@ -438,7 +438,8 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
 
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn,
                             custom_attn_mask, custom_attn_mask_pos, custom_attn_mask_n_pos,
-                            custom_attn_mask_n_head_groups, custom_attn_mask_sorted_pos);
+                            custom_attn_mask_n_head_groups, custom_attn_mask_sorted_pos,
+                            hier_mask);
 
     // Phase 5: fill state_kq_b tensor with external bias data (now that backend has allocated memory)
     if (state_kq_b != nullptr && state_bias_data != nullptr) {
@@ -469,6 +470,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
     this->custom_attn_mask_n_pos        = params.custom_attn_mask_n_pos;
     this->custom_attn_mask_n_head_groups = params.custom_attn_mask_n_head_groups;
     this->custom_attn_mask_sorted_pos   = params.custom_attn_mask_sorted_pos;
+    this->hier_mask                     = params.hier_mask;
 
     // update state bias pointers (may change between decodes)
     this->state_bias_data   = params.state_bias_data;
@@ -517,14 +519,16 @@ void llm_graph_input_attn_kv_iswa::set_input(const llama_ubatch * ubatch) {
 
     mctx->get_base()->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn,
                                          custom_attn_mask, custom_attn_mask_pos, custom_attn_mask_n_pos,
-                                         custom_attn_mask_n_head_groups, custom_attn_mask_sorted_pos);
+                                         custom_attn_mask_n_head_groups, custom_attn_mask_sorted_pos,
+                                         hier_mask);
 
     mctx->get_swa()->set_input_k_idxs(self_k_idxs_swa, ubatch);
     mctx->get_swa()->set_input_v_idxs(self_v_idxs_swa, ubatch);
 
     mctx->get_swa()->set_input_kq_mask(self_kq_mask_swa, ubatch, cparams.causal_attn,
                                         custom_attn_mask, custom_attn_mask_pos, custom_attn_mask_n_pos,
-                                        custom_attn_mask_n_head_groups, custom_attn_mask_sorted_pos);
+                                        custom_attn_mask_n_head_groups, custom_attn_mask_sorted_pos,
+                                        hier_mask);
 }
 
 bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
@@ -538,6 +542,7 @@ bool llm_graph_input_attn_kv_iswa::can_reuse(const llm_graph_params & params) {
     this->custom_attn_mask_n_pos        = params.custom_attn_mask_n_pos;
     this->custom_attn_mask_n_head_groups = params.custom_attn_mask_n_head_groups;
     this->custom_attn_mask_sorted_pos   = params.custom_attn_mask_sorted_pos;
+    this->hier_mask                     = params.hier_mask;
 
     bool res = true;
 
@@ -941,6 +946,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     custom_attn_mask_n_pos        (params.custom_attn_mask_n_pos),
     custom_attn_mask_n_head_groups(params.custom_attn_mask_n_head_groups),
     custom_attn_mask_sorted_pos   (params.custom_attn_mask_sorted_pos),
+    hier_mask                     (params.hier_mask),
     state_bias_data   (params.state_bias_data),
     state_bias_n_head (params.state_bias_n_head),
     state_bias_n_kv   (params.state_bias_n_kv),
@@ -2167,6 +2173,7 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     inp->custom_attn_mask_n_pos        = custom_attn_mask_n_pos;
     inp->custom_attn_mask_n_head_groups = custom_attn_mask_n_head_groups;
     inp->custom_attn_mask_sorted_pos   = custom_attn_mask_sorted_pos;
+    inp->hier_mask                     = hier_mask;
 
     // Phase 5: create state_kq_b tensor if external state bias is provided
     // The tensor is created here (build time) but filled in set_input() (after backend allocation)
@@ -2555,6 +2562,7 @@ llm_graph_input_attn_kv_iswa * llm_graph_context::build_attn_inp_kv_iswa() const
     inp->custom_attn_mask_n_pos        = custom_attn_mask_n_pos;
     inp->custom_attn_mask_n_head_groups = custom_attn_mask_n_head_groups;
     inp->custom_attn_mask_sorted_pos   = custom_attn_mask_sorted_pos;
+    inp->hier_mask                     = hier_mask;
 
     {
         inp->self_k_idxs = mctx_cur->get_base()->build_input_k_idxs(ctx0, ubatch);

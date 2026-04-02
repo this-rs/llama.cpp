@@ -16,6 +16,63 @@
 struct llama_model;
 class llama_batch_allocr;
 
+// hierarchical bank-level attention mask (H7 — BSR sparse)
+// Standalone struct so it can be forward-declared in other headers.
+// Instead of storing n_pos² dense values, stores:
+//   - intra_blocks: per-bank dense masks [bank_i: n_groups * bank_size² floats]
+//   - inter_values: inter-bank constant mask [n_groups * n_banks * n_banks]
+//   - bank layout: sizes, cumulative offsets, position mappings
+// Expanded on-the-fly in set_input_kq_mask() — ~160KB vs 1.1GB dense
+struct llama_attn_mask_hierarchical {
+    std::vector<float>     intra_blocks;    // concatenated per-bank dense masks
+    std::vector<int32_t>   intra_offsets;   // offset into intra_blocks for each bank [n_banks+1]
+    std::vector<float>     inter_values;    // [n_groups * n_banks * n_banks]
+    std::vector<int32_t>   bank_sizes;      // number of positions per bank [n_banks]
+    std::vector<llama_pos> bank_positions;   // concatenated positions per bank
+    std::vector<int32_t>   bank_pos_offsets; // offset into bank_positions for each bank [n_banks+1]
+    int32_t n_banks      = 0;
+    int32_t n_groups     = 1;
+    int32_t n_pos_total  = 0;               // sum of all bank_sizes
+
+    // pos → (bank_idx, local_idx) lookup — built once on set
+    std::unordered_map<llama_pos, std::pair<int32_t, int32_t>> pos_to_bank;
+
+    bool empty() const { return n_banks == 0; }
+
+    void build_lookup() {
+        pos_to_bank.clear();
+        pos_to_bank.reserve(n_pos_total);
+        for (int32_t b = 0; b < n_banks; b++) {
+            const int32_t off = bank_pos_offsets[b];
+            for (int32_t l = 0; l < bank_sizes[b]; l++) {
+                pos_to_bank[bank_positions[off + l]] = {b, l};
+            }
+        }
+    }
+
+    // Get the mask value for (group g, row position, col position)
+    float get_value(int32_t g, llama_pos row_pos, llama_pos col_pos) const {
+        auto it_row = pos_to_bank.find(row_pos);
+        auto it_col = pos_to_bank.find(col_pos);
+        if (it_row == pos_to_bank.end() || it_col == pos_to_bank.end()) {
+            return 0.0f; // position not in any bank → default (no masking)
+        }
+        const auto [bank_row, local_row] = it_row->second;
+        const auto [bank_col, local_col] = it_col->second;
+
+        if (bank_row == bank_col) {
+            // intra-bank: dense block lookup
+            const int32_t b = bank_row;
+            const int32_t bs = bank_sizes[b];
+            const int32_t block_offset = intra_offsets[b];
+            return intra_blocks[block_offset + (size_t)g * bs * bs + local_row * bs + local_col];
+        } else {
+            // inter-bank: constant per (group, bank_row, bank_col)
+            return inter_values[(size_t)g * n_banks * n_banks + bank_row * n_banks + bank_col];
+        }
+    }
+};
+
 class llama_io_read_i;
 class llama_io_write_i;
 
@@ -109,6 +166,21 @@ struct llama_context {
     // custom attention mask (position-indexed, AND logic with default mask)
     void set_attn_mask(const float * mask, const llama_pos * positions, int32_t n_pos,
                        int32_t n_head_groups, int32_t slot_id);
+
+    // hierarchical bank-level attention mask (BSR sparse — H7)
+    // Stores ~160KB of hierarchical data instead of expanding to dense n_pos²
+    void set_attn_mask_hierarchical(
+            const float   * intra_blocks,
+            const int32_t * intra_offsets,
+            const float   * inter_values,
+            const int32_t * bank_sizes,
+            const llama_pos * bank_positions,
+            int32_t n_banks,
+            int32_t n_groups,
+            int32_t slot_id);
+
+    // query hierarchical mask for a slot (returns empty sentinel if not set)
+    const llama_attn_mask_hierarchical & get_hier_mask_for_slot(int32_t slot_id) const;
 
     // external state bias — additive kq bias from SelfMetrics (Phase 5)
     void set_state_bias(const float * data, int32_t n_head, int32_t n_kv);
@@ -349,6 +421,10 @@ private:
     attn_mask_data                                  attn_mask_global; // slot_id = -1
     std::unordered_map<int32_t, attn_mask_data>     attn_mask_slots;  // slot_id >= 0
     static const attn_mask_data                     attn_mask_empty;  // sentinel for empty lookups
+
+    // hierarchical bank-level mask (H7 — BSR sparse, uses standalone struct above)
+    llama_attn_mask_hierarchical                                  hier_mask_global; // slot_id = -1
+    std::unordered_map<int32_t, llama_attn_mask_hierarchical>     hier_mask_slots;  // slot_id >= 0
 
     // state_kq_b — external attention bias from SelfMetrics (Phase 5)
     // Applied additively to kq scores in build_attn_mha, combined with model's own kq_b.
