@@ -66,6 +66,7 @@ const std::vector<std::string> type_names = {
     "iq4_nl",
     "mxfp4",
     "bf16",
+    "turbo3_0",
 };
 
 enum MatMulIdType {
@@ -655,7 +656,7 @@ void process_shaders() {
                 if (tname == "f16") {
                     string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn_cm1.comp",
                         merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
-                } else if (tname == "q4_0" || tname == "q8_0" || tname == "f32") {
+                } else if (tname == "q4_0" || tname == "q8_0" || tname == "f32" || tname == "turbo3_0") {
                     std::string data_a_key = "DATA_A_" + to_uppercase(tname);
                     string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn_cm1.comp",
                         merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(tname)}, {"COOPMAT", "1"}}), fp16, true, false, f16acc);
@@ -666,7 +667,7 @@ void process_shaders() {
                 if (tname == "f16") {
                     string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn.comp",
                         merge_maps(fa_base_dict, {{"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}), fp16, false, false, f16acc);
-                } else if (tname == "q4_0" || tname == "q8_0" || tname == "f32") {
+                } else if (tname == "q4_0" || tname == "q8_0" || tname == "f32" || tname == "turbo3_0") {
                     std::string data_a_key = "DATA_A_" + to_uppercase(tname);
                     string_to_spv("flash_attn_f32_f16_" + tname, "flash_attn.comp",
                         merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(tname) }}), fp16, false, false, f16acc);
@@ -769,6 +770,15 @@ void process_shaders() {
         string_to_spv("set_rows_" + t + "_i64",     "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
         string_to_spv("set_rows_" + t + "_i64_rte", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
     }
+
+    // TurboQuant3 SET_ROWS (dedicated shader: 128 cooperative threads for WHT + PolarQuant)
+    string_to_spv("set_rows_turbo3_0_i32",     "set_rows_turbo3.comp", {{"B_TYPE", "uint"},  {"B_SIZE", "32"}});
+    string_to_spv("set_rows_turbo3_0_i32_rte", "set_rows_turbo3.comp", {{"B_TYPE", "uint"},  {"B_SIZE", "32"}, {"RTE16", "1"}});
+    string_to_spv("set_rows_turbo3_0_i64",     "set_rows_turbo3.comp", {{"B_TYPE", "uvec2"}, {"B_SIZE", "64"}});
+    string_to_spv("set_rows_turbo3_0_i64_rte", "set_rows_turbo3.comp", {{"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"RTE16", "1"}});
+
+    // TurboQuant WHT (Walsh-Hadamard Transform) for Q rotation before Flash Attention
+    string_to_spv("turbo_wht_f32", "turbo_wht.comp", {});
 
     auto get_type_str = [](bool f16) {
         return f16 ? "float16_t" : "float";

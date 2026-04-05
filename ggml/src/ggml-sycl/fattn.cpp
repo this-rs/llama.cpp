@@ -88,6 +88,9 @@ static void ggml_sycl_flash_attn_ext_vec(ggml_backend_sycl_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
 #endif // GGML_SYCL_FA_ALL_QUANTS
 
+    // TurboQuant3 — always available (not gated by GGML_SYCL_FA_ALL_QUANTS)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
+
     GGML_ABORT("Not match KV type in vec");
 }
 
@@ -175,6 +178,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 #endif // GGML_SYCL_FA_ALL_QUANTS
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_TURBO3_0:
             break;
         default:
             return BEST_FATTN_KERNEL_NONE;
@@ -186,6 +190,12 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    // Turbo3 only has vec kernel support (tile kernel doesn't handle centroid-based dequant).
+    // Force VEC for all batch sizes when K or V is turbo3.
+    if (can_use_vector_kernel && (K->type == GGML_TYPE_TURBO3_0 || V->type == GGML_TYPE_TURBO3_0)) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
 
     // Todo: Use the XMX kernel if possible:
 

@@ -1,0 +1,247 @@
+// TurboQuant3 SET_ROWS — Vulkan compute shader
+//
+// Implements the 8-step PolarQuant pipeline for GGML_TYPE_TURBO3_0:
+//   1. Load 128 f32 elements (coalesced)
+//   2. Parallel L2 norm (shared memory reduction)
+//   3. Normalize by L2 norm
+//   4. Forward Walsh-Hadamard Transform (signs1 → butterfly → signs2)
+//   5. Quantize to 3-bit centroid index (8 Lloyd-Max centroids)
+//   6. Pack qs[] (2-bit low) and signs[] (1-bit high) via shared memory
+//   7. Reconstruction norm (parallel reduction)
+//   8. Write corrected norm = grp_norm / recon_norm
+//
+// One workgroup of 128 threads = one turbo3 block (128 elements).
+// Port of the CUDA kernel k_set_rows_turbo3 from set-rows.cu.
+
+#version 450
+
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+
+#include "rte.glsl"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+// Push constants (matches vk_op_binary_push_constants layout)
+layout (push_constant) uniform parameter
+{
+    uint ne;
+    uint ne00; uint ne01; uint ne02; uint ne03;
+    uint nb00; uint nb01; uint nb02; uint nb03;
+    uint ne10; uint ne11; uint ne12; uint ne13;
+    uint nb10; uint nb11; uint nb12; uint nb13;
+    uint ne20; uint ne21; uint ne22; uint ne23;
+    uint nb20; uint nb21; uint nb22; uint nb23;
+    uint misalign_offsets;
+    float param1; float param2; int param3;
+} p;
+
+// Bindings (same layout as SET_ROWS in copy_to_quant.comp)
+layout (binding = 0) readonly buffer S { float data_s[]; };
+layout (binding = 1) readonly buffer I { B_TYPE data_i[]; };
+
+// block_turbo3_0: {float16_t norm, uint8_t qs[32], uint8_t signs[16]} = 50 bytes
+// Matches ggml-common.h block_turbo3_0 exactly.
+struct block_turbo3_0 {
+    float16_t norm;       //  2 bytes: L2 norm correction factor
+    uint8_t   qs[32];     // 32 bytes: lower 2-bit indices, 4 per byte
+    uint8_t   signs[16];  // 16 bytes: upper 1-bit of 3-bit index, 8 per byte
+};
+
+layout (binding = 2) buffer Q { block_turbo3_0 data_q[]; };
+
+// ============================================================
+// TurboQuant 3-bit Constants (Lloyd-Max for N(0, 1/128))
+// Must match turbo-quant.cuh EXACTLY.
+// ============================================================
+
+const float CENTROIDS[8] = float[8](
+    -0.190685, -0.117832, -0.065717, -0.021460,
+     0.021460,  0.065717,  0.117832,  0.190685
+);
+
+const float MID[7] = float[7](
+    -0.154259, -0.091775, -0.043589, 0.0,
+     0.043589,  0.091775,  0.154259
+);
+
+// WHT sign arrays (seed=42)
+const float SIGNS1[128] = float[128](
+    -1, 1, 1,-1,-1, 1,-1, 1,-1,-1, 1, 1, 1, 1, 1, 1,
+     1,-1, 1,-1, 1,-1,-1, 1, 1, 1,-1, 1, 1,-1,-1,-1,
+    -1, 1, 1,-1, 1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1,
+     1, 1, 1,-1,-1,-1,-1,-1, 1,-1, 1, 1, 1, 1,-1, 1,
+    -1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1,
+     1,-1,-1, 1, 1, 1,-1,-1, 1, 1,-1, 1, 1,-1, 1,-1,
+    -1, 1, 1,-1, 1,-1, 1,-1, 1, 1, 1, 1,-1, 1,-1, 1,
+     1,-1, 1, 1,-1,-1,-1,-1,-1, 1, 1,-1, 1, 1,-1, 1
+);
+
+const float SIGNS2[128] = float[128](
+     1, 1, 1, 1,-1, 1, 1,-1, 1,-1,-1,-1, 1,-1,-1,-1,
+     1, 1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1,-1, 1, 1, 1,
+     1, 1,-1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1, 1,-1,
+     1,-1, 1, 1, 1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1,
+     1,-1, 1,-1,-1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1, 1,
+    -1, 1,-1, 1, 1,-1, 1,-1,-1,-1,-1, 1,-1,-1, 1,-1,
+     1,-1, 1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1,-1, 1,
+    -1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,-1,-1,-1, 1,-1
+);
+
+const float INV_SQRT_128 = 0.08838834764831845;
+
+// ============================================================
+// Shared Memory
+// ============================================================
+
+shared float smem[128];  // WHT data + reduction scratch
+shared uint  sidx[128];  // quantized indices for cooperative packing
+
+// ============================================================
+// Helpers
+// ============================================================
+
+uint get_aoffset() { return p.misalign_offsets >> 16; }
+uint get_boffset() { return (p.misalign_offsets >> 8) & 0xFFu; }
+uint get_doffset() { return p.misalign_offsets & 0xFFu; }
+
+// Nearest 3-bit centroid via binary search on midpoints
+uint nearest_3bit(float v) {
+    if (v > MID[3]) {
+        return v > MID[5] ? (v > MID[6] ? 7u : 6u) : (v > MID[4] ? 5u : 4u);
+    } else {
+        return v > MID[1] ? (v > MID[2] ? 3u : 2u) : (v > MID[0] ? 1u : 0u);
+    }
+}
+
+// Parallel tree reduction: smem[0..127] → smem[0]
+// All 128 threads must participate (barrier inside).
+void reduce_sum_128() {
+    [[unroll]] for (uint s = 64u; s >= 1u; s >>= 1u) {
+        if (gl_LocalInvocationID.x < s) {
+            smem[gl_LocalInvocationID.x] += smem[gl_LocalInvocationID.x + s];
+        }
+        barrier();
+    }
+}
+
+// ============================================================
+// Main
+// ============================================================
+
+void main() {
+    // Each workgroup handles one 128-element turbo3 block
+    uint grp = gl_WorkGroupID.z * 262144u + gl_WorkGroupID.y * 512u + gl_WorkGroupID.x;
+    uint j   = gl_LocalInvocationID.x; // 0..127
+
+    // Decode flat group index → (i_grp, i01, i02, i03)
+    uint n_grp_row = p.ne00 / 128u;
+    uint i_grp = grp % n_grp_row;
+    uint tmp   = grp / n_grp_row;
+    uint i01   = tmp % p.ne01;
+    tmp        = tmp / p.ne01;
+    uint i02   = tmp % p.ne02;
+    uint i03   = tmp / p.ne02;
+
+    // Broadcast to src1 dimensions
+    uint i11 = i01 % p.ne11;
+    uint i12 = i02 % p.ne12;
+
+    // Read destination row index from src1 (index tensor)
+    uint src1_off = i01 * p.nb10 + i11 * p.nb11 + i12 * p.nb12 + get_boffset();
+    uint dst_row;
+#if B_SIZE == 64
+    dst_row = data_i[src1_off].x;
+#else
+    dst_row = data_i[src1_off];
+#endif
+
+    // Source float index (using full strides for non-contiguous support)
+    uint src_idx = get_aoffset()
+                 + (i_grp * 128u + j) * p.nb00
+                 + i01 * p.nb01
+                 + i02 * p.nb02
+                 + i03 * p.nb03;
+
+    // Destination block index
+    uint dst_blk = get_doffset()
+                 + i_grp * p.nb20
+                 + dst_row * p.nb21
+                 + i02 * p.nb22
+                 + i03 * p.nb23;
+
+    // ---- Step 1: Load source value (coalesced) ----
+    float my_val = data_s[src_idx];
+
+    // ---- Step 2: Parallel L2 norm ----
+    smem[j] = my_val * my_val;
+    barrier();
+    reduce_sum_128();
+    float grp_norm = sqrt(smem[0]);
+    float inv_norm = (grp_norm > 1e-10) ? 1.0 / grp_norm : 0.0;
+
+    // ---- Step 3: Normalize ----
+    float normed = my_val * inv_norm;
+
+    // ---- Step 4: Forward WHT (signs1 → butterfly stages → signs2) ----
+    smem[j] = normed * SIGNS1[j];
+    barrier();
+
+    // Butterfly stages: h = 1, 2, 4, 8, 16, 32, 64
+    [[unroll]] for (uint h = 1u; h < 128u; h <<= 1u) {
+        if ((j & (2u * h - 1u)) < h) {
+            float a = smem[j];
+            float b = smem[j + h];
+            smem[j]     = a + b;
+            smem[j + h] = a - b;
+        }
+        barrier();
+    }
+
+    // Apply 1/sqrt(128) normalization and second sign flip
+    float rotated = smem[j] * INV_SQRT_128 * SIGNS2[j];
+
+    // ---- Step 5: Quantize to nearest 3-bit centroid ----
+    uint idx = nearest_3bit(rotated);
+
+    // ---- Step 6: Pack qs[] and signs[] via shared memory ----
+    sidx[j] = idx;
+    barrier();
+
+    // qs: 4 elements per byte, 2 low bits each → 32 bytes
+    if (j < 32u) {
+        uint base = j * 4u;
+        uint8_t byte_val = uint8_t(
+             (sidx[base      ] & 0x3u)
+          | ((sidx[base + 1u] & 0x3u) << 2)
+          | ((sidx[base + 2u] & 0x3u) << 4)
+          | ((sidx[base + 3u] & 0x3u) << 6)
+        );
+        data_q[dst_blk].qs[j] = byte_val;
+    }
+
+    // signs: 8 elements per byte, bit 2 of 3-bit index → 16 bytes
+    if (j < 16u) {
+        uint base = j * 8u;
+        uint8_t sign_byte = uint8_t(0);
+        [[unroll]] for (uint k = 0u; k < 8u; k++) {
+            sign_byte |= uint8_t(((sidx[base + k] >> 2) & 1u) << k);
+        }
+        data_q[dst_blk].signs[j] = sign_byte;
+    }
+
+    // ---- Step 7: Reconstruction norm (parallel reduction) ----
+    float c = CENTROIDS[idx];
+    smem[j] = c * c;
+    barrier();
+    reduce_sum_128();
+    float recon_norm = sqrt(smem[0]);
+    float corrected  = (recon_norm > 1e-10) ? grp_norm / recon_norm : grp_norm;
+
+    // ---- Step 8: Write corrected norm (one thread) ----
+    if (j == 0u) {
+        data_q[dst_blk].norm = float16_t(corrected);
+    }
+}

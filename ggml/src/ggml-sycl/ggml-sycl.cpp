@@ -54,6 +54,7 @@
 #include "ggml-sycl/set.hpp"
 #include "ggml-sycl/ssm_conv.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
+#include "ggml-sycl/turbo-wht.hpp"
 
 
 static bool g_sycl_loaded = false;
@@ -569,9 +570,15 @@ static void ggml_backend_sycl_buffer_clear(ggml_backend_buffer_t buffer,
     SYCL_CHECK(
         CHECK_TRY_ERROR(dpct::get_current_device().queues_wait_and_throw()));
 
-    SYCL_CHECK(CHECK_TRY_ERROR((*stream)
-                                    .memset(ctx->dev_ptr, value, buffer->size)
-                                    .wait()));
+    constexpr size_t MAX_CHUNK = 2ULL << 30;  // 2 GiB
+    for (size_t off = 0; off < buffer->size; off += MAX_CHUNK) {
+        size_t chunk = std::min(buffer->size - off, MAX_CHUNK);
+        SYCL_CHECK(CHECK_TRY_ERROR(
+            (*stream)
+                .memset(static_cast<char*>(ctx->dev_ptr) + off, value, chunk)
+                .wait()
+        ));
+    }
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -3513,6 +3520,11 @@ static bool can_use_dequantize_mul_mat_vec(const ggml_tensor * src0, const ggml_
 }
 
 static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // Turbo3 uses centroid-based quantization (not linear), can't use dp4a mmvq path.
+    // It falls through to the generic dequantize→GEMM path instead.
+    if (src0->type == GGML_TYPE_TURBO3_0) {
+        return false;
+    }
     return ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
            src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 }
@@ -4199,6 +4211,9 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_sycl_flash_attn_ext(ctx, dst);
             break;
+        case GGML_OP_TURBO_WHT:
+            ggml_sycl_turbo_wht(ctx, dst);
+            break;
         default:
             return false;
     }
@@ -4708,10 +4723,16 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
 
         case GGML_OP_SET_ROWS:
             {
-                return ((op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
-                         op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q5_0 ||
-                         op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_IQ4_NL) &&
-                        (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32));
+                // turbo3 requires head_dim divisible by 128 (WHT group size)
+                if (op->type == GGML_TYPE_TURBO3_0 && op->src[0]->ne[0] % 128 != 0) {
+                    return false;
+                }
+                return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
+                        op->type == GGML_TYPE_Q8_0 || op->type == GGML_TYPE_Q5_1 || op->type == GGML_TYPE_Q5_0 ||
+                        op->type == GGML_TYPE_Q4_1 || op->type == GGML_TYPE_Q4_0 || op->type == GGML_TYPE_IQ4_NL ||
+                        op->type == GGML_TYPE_TURBO3_0) &&
+                       op->src[0]->type == GGML_TYPE_F32 &&
+                       (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
             }
             break;
         case GGML_OP_CPY:
@@ -4893,6 +4914,9 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
             return op->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_sycl_flash_attn_ext_supported(device, op);
+        case GGML_OP_TURBO_WHT:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32
+                && ggml_is_contiguous(op->src[0]);
         default:
             return false;
     }

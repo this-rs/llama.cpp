@@ -1212,6 +1212,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     return false;
                 }
             }
+            // Note: turbo+dk>=512 was previously blocked here due to Metal shader
+            // compilation failure. The fix is nsg=4 (set in ggml-metal-ops.cpp) which
+            // keeps SMEM at exactly 32KB (the Metal limit). The kernel instances for
+            // turbo+dk512 exist in the .metal file. Enabling FA on these 30 layers
+            // (full-attention in Gemma 4) gives ~2× speedup vs matmul fallback.
             return has_simdgroup_mm; // TODO: over-restricted for vec-kernels
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:

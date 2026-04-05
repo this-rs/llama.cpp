@@ -1,0 +1,106 @@
+// TurboQuant Walsh-Hadamard Transform — Vulkan compute shader
+//
+// Applies forward or inverse WHT per 128-element group.
+// Used to pre-rotate Q queries into WHT space before Flash Attention
+// with turbo3 quantized KV cache.
+//
+// Forward WHT:  signs1 → butterfly (7 stages) → signs2 → normalize
+// Inverse WHT:  signs2 → butterfly (7 stages) → signs1 → normalize
+//
+// One workgroup of 128 threads = one 128-element WHT group.
+// Port of the CUDA kernel k_turbo_wht_f32 from turbo-wht.cu.
+
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+// Push constants
+layout (push_constant) uniform parameter
+{
+    uint n_elements;   // total elements in tensor
+    uint head_dim;     // ne[0] of the source tensor
+    uint groups_per_head; // head_dim / 128
+    int  direction;    // 0 = forward, 1 = inverse
+} p;
+
+layout (binding = 0) readonly  buffer S { float data_s[]; };
+layout (binding = 1) writeonly buffer D { float data_d[]; };
+
+// ============================================================
+// WHT sign arrays (seed=42) — must match turbo-quant.cuh EXACTLY
+// ============================================================
+
+const float SIGNS1[128] = float[128](
+    -1, 1, 1,-1,-1, 1,-1, 1,-1,-1, 1, 1, 1, 1, 1, 1,
+     1,-1, 1,-1, 1,-1,-1, 1, 1, 1,-1, 1, 1,-1,-1,-1,
+    -1, 1, 1,-1, 1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1,
+     1, 1, 1,-1,-1,-1,-1,-1, 1,-1, 1, 1, 1, 1,-1, 1,
+    -1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1,
+     1,-1,-1, 1, 1, 1,-1,-1, 1, 1,-1, 1, 1,-1, 1,-1,
+    -1, 1, 1,-1, 1,-1, 1,-1, 1, 1, 1, 1,-1, 1,-1, 1,
+     1,-1, 1, 1,-1,-1,-1,-1,-1, 1, 1,-1, 1, 1,-1, 1
+);
+
+const float SIGNS2[128] = float[128](
+     1, 1, 1, 1,-1, 1, 1,-1, 1,-1,-1,-1, 1,-1,-1,-1,
+     1, 1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1,-1, 1, 1, 1,
+     1, 1,-1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1, 1,-1,
+     1,-1, 1, 1, 1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1,
+     1,-1, 1,-1,-1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1, 1,
+    -1, 1,-1, 1, 1,-1, 1,-1,-1,-1,-1, 1,-1,-1, 1,-1,
+     1,-1, 1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1,-1, 1,
+    -1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,-1,-1,-1, 1,-1
+);
+
+const float INV_SQRT_128 = 0.08838834764831845;
+
+// ============================================================
+// Shared Memory
+// ============================================================
+
+shared float smem[128];
+
+// ============================================================
+// Main
+// ============================================================
+
+void main() {
+    // Each workgroup handles one 128-element WHT group
+    uint grp = gl_WorkGroupID.z * gl_NumWorkGroups.x * gl_NumWorkGroups.y
+             + gl_WorkGroupID.y * gl_NumWorkGroups.x
+             + gl_WorkGroupID.x;
+    uint t = gl_LocalInvocationID.x; // 0..127
+
+    // Map group index to position in tensor (head-aware)
+    uint head_idx    = grp / p.groups_per_head;
+    uint grp_in_head = grp % p.groups_per_head;
+    uint base        = head_idx * p.head_dim + grp_in_head * 128u;
+
+    // Bounds check
+    uint n_groups = p.n_elements / 128u;
+    if (grp >= n_groups) return;
+
+    // ---- Load + apply first sign array ----
+    float val = data_s[base + t];
+    smem[t] = val * ((p.direction == 0) ? SIGNS1[t] : SIGNS2[t]);
+    barrier();
+
+    // ---- WHT butterfly: 7 stages (h = 1, 2, 4, 8, 16, 32, 64) ----
+    [[unroll]] for (uint h = 1u; h < 128u; h <<= 1u) {
+        if ((t & (2u * h - 1u)) < h) {
+            float a = smem[t];
+            float b = smem[t + h];
+            smem[t]     = a + b;
+            smem[t + h] = a - b;
+        }
+        barrier();
+    }
+
+    // ---- Normalize + apply second sign array + write output ----
+    float result = smem[t] * INV_SQRT_128
+                 * ((p.direction == 0) ? SIGNS2[t] : SIGNS1[t]);
+
+    data_d[base + t] = result;
+}
