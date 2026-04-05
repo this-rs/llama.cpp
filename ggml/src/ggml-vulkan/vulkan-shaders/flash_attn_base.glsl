@@ -160,31 +160,38 @@ const FLOAT_TYPE turbo3_fa_centroids[8] = FLOAT_TYPE[8](
 
 // Q is rotated by a separate TURBO_WHT op before FA, so <Q_rot, K_rot> = <Q, K>.
 // Dequant is just centroid_lookup × norm (no inverse WHT needed).
+//
+// IMPORTANT: In the FA kernel, iqs = coord % BLOCK_SIZE is an ELEMENT offset
+// (multiples of 4: 0, 4, 8, …, 124), NOT a group index. Convert to group index
+// first (grp = iqs / 4) — consistent with how Q4_0/Q8_0 handle element-based iqs.
 FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    // Convert element offset → group-of-4 index (0..31 for 128-element block)
+    uint grp = iqs / 4u;
+
     FLOAT_TYPE norm;
     uint qs_val, signs_val;
 
     if (binding_idx == BINDING_IDX_K) {
         norm = FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].norm);
-        qs_val = uint(k_packed.k_data_packed16[a_offset + ib].qs[iqs / 2]);
-        signs_val = uint(k_packed.k_data_packed16[a_offset + ib].signs[iqs / 4]);
+        qs_val = uint(k_packed.k_data_packed16[a_offset + ib].qs[grp / 2]);
+        signs_val = uint(k_packed.k_data_packed16[a_offset + ib].signs[grp / 4]);
     } else {
         norm = FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].norm);
-        qs_val = uint(v_packed.v_data_packed16[a_offset + ib].qs[iqs / 2]);
-        signs_val = uint(v_packed.v_data_packed16[a_offset + ib].signs[iqs / 4]);
+        qs_val = uint(v_packed.v_data_packed16[a_offset + ib].qs[grp / 2]);
+        signs_val = uint(v_packed.v_data_packed16[a_offset + ib].signs[grp / 4]);
     }
 
     // Each uint16 in qs[] holds 8 x 2-bit values (4 per byte, 2 bytes per uint16)
-    // iqs indexes groups of 4 elements. Each uint16 covers 8 elements (2 groups).
-    uint qs_shift = (iqs & 1u) * 8u;  // 0 for even iqs, 8 for odd
+    // grp indexes groups of 4 elements. Each uint16 covers 2 groups (8 elements).
+    uint qs_shift = (grp & 1u) * 8u;  // 0 for even grp, 8 for odd
     uint q0 = (qs_val >> (qs_shift + 0u)) & 0x3u;
     uint q1 = (qs_val >> (qs_shift + 2u)) & 0x3u;
     uint q2 = (qs_val >> (qs_shift + 4u)) & 0x3u;
     uint q3 = (qs_val >> (qs_shift + 6u)) & 0x3u;
 
     // Each uint16 in signs[] holds 16 x 1-bit values (8 per byte, 2 bytes per uint16)
-    // iqs indexes groups of 4 elements, so base element = iqs * 4
-    uint s_shift = (iqs * 4u) & 15u;  // bit offset within the uint16
+    // grp indexes groups of 4 elements, so base element = grp * 4
+    uint s_shift = (grp * 4u) & 15u;  // bit offset within the uint16
     uint s0 = (signs_val >> (s_shift + 0u)) & 1u;
     uint s1 = (signs_val >> (s_shift + 1u)) & 1u;
     uint s2 = (signs_val >> (s_shift + 2u)) & 1u;
