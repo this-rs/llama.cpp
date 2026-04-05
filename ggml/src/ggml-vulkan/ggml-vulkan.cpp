@@ -3028,6 +3028,11 @@ static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_
         path = FA_SCALAR;
     }
 
+    // TurboQuant3: force scalar path — coopmat dequantize4 for turbo3 is not yet validated
+    if (kv_type == GGML_TYPE_TURBO3_0 && path != FA_SCALAR) {
+        path = FA_SCALAR;
+    }
+
     switch (path) {
     case FA_SCALAR:
         return get_fa_tuning_params_scalar(device, hsk, hsv, n_rows, n_kv, kv_type, f32acc);
