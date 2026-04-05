@@ -100,7 +100,9 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
     constexpr int nthreads_V_q  = (D/4 < warp_size ? D/4 : warp_size);
 
     constexpr int nthreads    = ggml_sycl_fattn_vec_get_nthreads_device();
-    constexpr int nthreads_KQ = type_K == GGML_TYPE_F16 ? 128 / cpy_nb : nthreads_KQ_q;
+    // Turbo3 uses float Q (like F16) because centroid-based dequant can't use dp4a.
+    constexpr bool is_K_float_dot = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_TURBO3_0);
+    constexpr int nthreads_KQ = is_K_float_dot ? 128 / cpy_nb : nthreads_KQ_q;
     constexpr int nthreads_V  = type_V == GGML_TYPE_F16 ? 128 / cpy_nb : nthreads_V_q;
 
     static_assert(warp_size % nthreads_KQ == 0, "bad nthreads_K");
@@ -110,7 +112,7 @@ static void flash_attn_ext_vec(const char* __restrict__ Q,
     constexpr int V_cols_per_iter   = warp_size / nthreads_V;
 
     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ, warp_size>();
-    constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16;
+    constexpr bool Q_q8_1 = !is_K_float_dot;
 #ifdef GGML_SYCL_F16
     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, sycl::half, V_rows_per_thread>();
 #else

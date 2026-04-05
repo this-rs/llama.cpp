@@ -5,6 +5,7 @@
 #include "common.hpp"
 #include "convert.hpp"
 #include "vecdotq.hpp"
+#include "turbo-quant.hpp"
 
 #include "ggml.h"
 
@@ -573,6 +574,96 @@ static __dpct_inline__ void dequantize_V_q8_0(const void * __restrict__ vx, void
     }
 }
 
+// ============================================================
+// TurboQuant3 (GGML_TYPE_TURBO3_0) — Flash Attention support
+// ============================================================
+
+// K·Q dot product for turbo3 K.  Q is in float2/half2 format (Q_q8_1 = false).
+// Matches the F16 vec_dot access pattern: iterates float2 pairs with cpy_ne stride.
+template <int D, int nthreads>
+static __dpct_inline__ float vec_dot_fattn_vec_KQ_turbo3_0(const char * __restrict__ K_c,
+                                                            const void * __restrict__ Q_v,
+                                                            const int * __restrict__ Q_q8,
+                                                            const void * __restrict__ Q_ds_v) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    const block_turbo3_0 * K_turbo3 = (const block_turbo3_0 *) K_c;
+    GGML_UNUSED(Q_q8);
+    GGML_UNUSED(Q_ds_v);
+
+    constexpr int cpy_nb = ggml_sycl_get_max_cpy_bytes();
+    constexpr int cpy_ne = cpy_nb / 4;
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < D/2; k_KQ_0 += nthreads*cpy_ne) {
+#pragma unroll
+        for (int k_KQ_1 = 0; k_KQ_1 < cpy_ne; ++k_KQ_1) {
+            // Global float2 index for this thread
+            const int k_half2 = k_KQ_0
+                + (nthreads == 1 ? 0 : (item_ct1.get_local_id(2) % nthreads)) * cpy_ne
+                + k_KQ_1;
+
+            // Map float2 index to element pair
+            const int elem0 = k_half2 * 2;
+            const int elem1 = elem0 + 1;
+
+            // Turbo3 block index and element within block
+            const int ib   = elem0 / QK_TURBO3;
+            const int j0   = elem0 % QK_TURBO3;
+            const int j1   = elem1 % QK_TURBO3;
+
+            const float norm = sycl::vec<sycl::half, 1>(K_turbo3[ib].norm)
+                                   .convert<float, sycl::rounding_mode::automatic>()[0];
+
+            const float k0 = turbo3_dequant_element_sycl(&K_turbo3[ib], j0, norm);
+            const float k1 = turbo3_dequant_element_sycl(&K_turbo3[ib], j1, norm);
+
+#ifdef GGML_SYCL_F16
+            const sycl::float2 q_f2 = ((const sycl::half2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1]
+                .template convert<float, sycl::rounding_mode::automatic>();
+            sum += k0 * q_f2.x() + k1 * q_f2.y();
+#else
+            const sycl::float2 q_f2 = ((const sycl::float2 *) Q_v)[k_KQ_0/nthreads + k_KQ_1];
+            sum += k0 * q_f2.x() + k1 * q_f2.y();
+#endif
+        }
+    }
+
+    return sum;
+}
+
+// V dequantization for turbo3: dequantize `ne` elements starting at i0.
+template <typename T, int ne>
+static __dpct_inline__ void dequantize_V_turbo3_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_turbo3_0 * x = (const block_turbo3_0 *) vx;
+
+    const int64_t ib  = i0 / QK_TURBO3;
+    const int     iqs = i0 % QK_TURBO3;
+
+    const float norm = sycl::vec<sycl::half, 1>(x[ib].norm)
+                           .convert<float, sycl::rounding_mode::automatic>()[0];
+
+#ifdef GGML_SYCL_F16
+    if constexpr (std::is_same_v<T, sycl::half>) {
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            const float v0 = turbo3_dequant_element_sycl(&x[ib], iqs + l0,     norm);
+            const float v1 = turbo3_dequant_element_sycl(&x[ib], iqs + l0 + 1, norm);
+            ((sycl::half2 *) dst)[l0 / 2] = sycl::half2(v0, v1);
+        }
+    } else
+#endif // GGML_SYCL_F16
+    if constexpr (std::is_same_v<T, float>) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = turbo3_dequant_element_sycl(&x[ib], iqs + l, norm);
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
 template <int type_K, int D, int nthreads, int warp_size>
 constexpr vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -587,6 +678,8 @@ constexpr vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q5_1<D, nthreads, warp_size>;
     } else if constexpr (type_K == GGML_TYPE_Q8_0) {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads, warp_size>;
+    } else if constexpr (type_K == GGML_TYPE_TURBO3_0) {
+        return vec_dot_fattn_vec_KQ_turbo3_0<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -607,6 +700,8 @@ constexpr dequantize_V_t get_dequantize_V() {
         return dequantize_V_q5_1<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q8_0) {
         return dequantize_V_q8_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TURBO3_0) {
+        return dequantize_V_turbo3_0<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

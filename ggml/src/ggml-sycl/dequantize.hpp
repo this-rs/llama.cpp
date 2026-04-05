@@ -14,6 +14,7 @@
 #define GGML_SYCL_DEQUANTIZE_HPP
 
 #include "common.hpp"
+#include "turbo-quant.hpp"
 
 typedef void (*dequantize_kernel_t)(const void * vx, const int64_t ib, const int iqs, dfloat2 & v);
 typedef void (*dequantize_kernel_t_reorder)(const void *d, const int64_t ib, const void *qs,
@@ -869,5 +870,65 @@ static void dequantize_block_nvfp4(
     yy[y1] = ggml_sycl_cast<dst_t>(d * kvalues_mxfp4[q >> 4]);
 }
 
+// ============================================================
+// TurboQuant3 (GGML_TYPE_TURBO3_0) — 3-bit PolarQuant + WHT
+// Block: { ggml_half norm, uint8_t qs[32], uint8_t signs[16] } = 50 bytes, 128 elements
+// ============================================================
+
+// Inline dequantize for dequantize_block template (non-FA path).
+// iqs = element index within block (0, 2, 4, ..., 126) — produces 2 consecutive floats.
+// NOTE: In the FA path (fattn), iqs is an element OFFSET stepping by 4 and needs
+//       grp = iqs / 4 — that fix lives in fattn-common.hpp, NOT here.
+static __dpct_inline__ void dequantize_turbo3_0(const void *vx, const int64_t ib,
+                                                 const int iqs, dfloat2 &v) {
+    const block_turbo3_0 * x = (const block_turbo3_0 *) vx;
+
+    const float norm = sycl::vec<sycl::half, 1>(x[ib].norm)
+                           .convert<float, sycl::rounding_mode::automatic>()[0];
+
+    v.x() = turbo3_dequant_element_sycl(&x[ib], iqs + 0, norm);
+    v.y() = turbo3_dequant_element_sycl(&x[ib], iqs + 1, norm);
+}
+
+// Row-level dequantize kernel for turbo3_0 (128 threads per block).
+// One workgroup processes one turbo3 block (128 elements).
+template<typename dst_t>
+static void dequantize_block_turbo3_0(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t nb,
+                                       const sycl::nd_item<3> &item_ct1) {
+    const int64_t i = item_ct1.get_group(2);
+    if (i >= nb) {
+        return;
+    }
+
+    const int64_t tid = item_ct1.get_local_id(2); // 0..127
+
+    const block_turbo3_0 * x = (const block_turbo3_0 *)vx + i;
+    const float norm = sycl::vec<sycl::half, 1>(x->norm)
+                           .convert<float, sycl::rounding_mode::automatic>()[0];
+
+    dst_t * y = yy + i * QK_TURBO3;
+
+    // Each thread dequantizes one element
+    if (tid < QK_TURBO3) {
+        y[tid] = turbo3_dequant_element_sycl(x, tid, norm);
+    }
+}
+
+// SYCL launcher for row-level turbo3 dequantize
+template<typename dst_t>
+static void dequantize_row_turbo3_0_sycl(const void *vx, dst_t *y,
+                                          const int64_t k, dpct::queue_ptr stream) {
+    const int64_t nb = k / QK_TURBO3;
+    {
+        dpct::has_capability_or_fail(stream->get_device(), {sycl::aspect::fp16});
+        stream->parallel_for(
+            sycl::nd_range<3>(
+                sycl::range<3>(1, 1, nb) * sycl::range<3>(1, 1, 128),
+                sycl::range<3>(1, 1, 128)),
+            [=](sycl::nd_item<3> item_ct1) {
+                dequantize_block_turbo3_0(vx, y, nb, item_ct1);
+            });
+    }
+}
 
 #endif // GGML_SYCL_DEQUANTIZE_HPP

@@ -655,6 +655,8 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
             return dequantize_row_mxfp4_sycl;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_sycl;
+        case GGML_TYPE_TURBO3_0:
+            return dequantize_row_turbo3_0_sycl;
         case GGML_TYPE_F32:
             return convert_unary_sycl<float>;
 #ifdef GGML_SYCL_HAS_BF16
@@ -725,6 +727,8 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
             return dequantize_row_mxfp4_sycl;
         case GGML_TYPE_NVFP4:
             return dequantize_row_nvfp4_sycl;
+        case GGML_TYPE_TURBO3_0:
+            return dequantize_row_turbo3_0_sycl;
         case GGML_TYPE_F16:
             return convert_unary_sycl<sycl::half>;
 #ifdef GGML_SYCL_HAS_BF16
