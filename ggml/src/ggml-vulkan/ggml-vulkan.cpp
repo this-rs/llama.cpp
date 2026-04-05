@@ -754,6 +754,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_mul_rope_f32_f16;
     vk_pipeline pipeline_rms_norm_back_f32;
     vk_pipeline pipeline_l2_norm_f32;
+    vk_pipeline pipeline_turbo_wht_f32;
 
     // [src/dst 0=fp32,1=fp16]
     vk_pipeline pipeline_exp[2];
@@ -1122,6 +1123,13 @@ struct vk_op_glu_push_constants {
     uint32_t nb13;
     uint32_t ne11;
     uint32_t ne12;
+};
+
+struct vk_op_turbo_wht_push_constants {
+    uint32_t n_elements;      // total elements in tensor
+    uint32_t head_dim;        // ne[0] of source tensor
+    uint32_t groups_per_head; // head_dim / 128
+    int32_t  direction;       // 0 = forward, 1 = inverse
 };
 
 struct vk_op_unary_push_constants {
@@ -3447,11 +3455,13 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_FA(GGML_TYPE_F16, f16, FA_SCALAR, )
         CREATE_FA(GGML_TYPE_Q4_0, q4_0, FA_SCALAR, )
         CREATE_FA(GGML_TYPE_Q8_0, q8_0, FA_SCALAR, )
+        CREATE_FA(GGML_TYPE_TURBO3_0, turbo3_0, FA_SCALAR, )
     } else {
         CREATE_FA(GGML_TYPE_F32, f32, FA_SCALAR, _fp32)
         CREATE_FA(GGML_TYPE_F16, f16, FA_SCALAR, _fp32)
         CREATE_FA(GGML_TYPE_Q4_0, q4_0, FA_SCALAR, _fp32)
         CREATE_FA(GGML_TYPE_Q8_0, q8_0, FA_SCALAR, _fp32)
+        CREATE_FA(GGML_TYPE_TURBO3_0, turbo3_0, FA_SCALAR, _fp32)
     }
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     if (device->coopmat1_fa_support) {
@@ -4277,6 +4287,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
     ggml_vk_create_pipeline(device, device->pipeline_rms_norm_back_f32, "rms_norm_back_f32", rms_norm_back_f32_len, rms_norm_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_l2_norm_f32, "l2_norm_f32", l2_norm_f32_len, l2_norm_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_turbo_wht_f32, "turbo_wht_f32", turbo_wht_f32_len, turbo_wht_f32_data, "main", 2, sizeof(vk_op_turbo_wht_push_constants), {128, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_f32, "cpy_f32_f32", cpy_f32_f32_len, cpy_f32_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_f16, "cpy_f32_f16", cpy_f32_f16_len, cpy_f32_f16_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
@@ -4332,6 +4343,15 @@ static void ggml_vk_load_shaders(vk_device& device) {
         SET_ROWS(_i64, )
     }
 #undef SET_ROWS
+
+    // TurboQuant3 SET_ROWS (dedicated shader with 128 cooperative threads for WHT + PolarQuant)
+    if (device->float_controls_rte_fp16) {
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows_i32[GGML_TYPE_TURBO3_0], "set_rows_turbo3_0_i32", set_rows_turbo3_0_i32_rte_len, set_rows_turbo3_0_i32_rte_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {}, 1, true);
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows_i64[GGML_TYPE_TURBO3_0], "set_rows_turbo3_0_i64", set_rows_turbo3_0_i64_rte_len, set_rows_turbo3_0_i64_rte_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {}, 1, true);
+    } else {
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows_i32[GGML_TYPE_TURBO3_0], "set_rows_turbo3_0_i32", set_rows_turbo3_0_i32_len, set_rows_turbo3_0_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {}, 1, true);
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows_i64[GGML_TYPE_TURBO3_0], "set_rows_turbo3_0_i64", set_rows_turbo3_0_i64_len, set_rows_turbo3_0_i64_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {}, 1, true);
+    }
 
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q4_0], "cpy_q4_0_f32", cpy_q4_0_f32_len, cpy_q4_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q4_0), 1, 1}, {}, 1);
@@ -9339,6 +9359,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_l2_norm_f32;
         }
         return nullptr;
+    case GGML_OP_TURBO_WHT:
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_turbo_wht_f32;
+        }
+        return nullptr;
     case GGML_OP_UNARY:
         if ((src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) ||
             (dst->type != GGML_TYPE_F32 && dst->type != GGML_TYPE_F16) ||
@@ -10056,7 +10081,10 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_SET_ROWS:
         {
             uint32_t ne = ggml_nelements(src0);
-            if (ggml_is_quantized(dst->type)) {
+            if (dst->type == GGML_TYPE_TURBO3_0) {
+                // turbo3 uses 128 cooperative threads per 128-element block
+                ne = CEIL_DIV(ne, 128);
+            } else if (ggml_is_quantized(dst->type)) {
                 // quants run 32 threads each doing QUANT_K elements
                 ne = CEIL_DIV(ne, 32 * ggml_blck_size(dst->type));
             } else {
@@ -11032,6 +11060,40 @@ static void ggml_vk_l2_norm(ggml_backend_vk_context * ctx, vk_context& subctx, c
     vk_op_unary_push_constants p = vk_op_unary_push_constants_init(src0, dst);
     p.param1 = op_params[0];
     ggml_vk_op_f32<vk_op_unary_push_constants>(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_L2_NORM, std::move(p));
+}
+
+static void ggml_vk_turbo_wht(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    int direction, group_size;
+    memcpy(&direction, dst->op_params + 0, sizeof(int));
+    memcpy(&group_size, dst->op_params + sizeof(int), sizeof(int));
+    GGML_ASSERT(group_size == 128); // Vulkan only supports 128-element WHT groups
+
+    const uint32_t n_elements = (uint32_t)ggml_nelements(src0);
+    const uint32_t head_dim = (uint32_t)src0->ne[0];
+    const uint32_t groups_per_head = head_dim / 128;
+    const uint32_t n_groups = n_elements / 128;
+
+    vk_op_turbo_wht_push_constants pc = {
+        n_elements,
+        head_dim,
+        groups_per_head,
+        direction,
+    };
+
+    vk_pipeline pipeline = ctx->device->pipeline_turbo_wht_f32;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer src0_buf = ggml_vk_tensor_subbuffer(ctx, src0);
+    vk_subbuffer dst_buf  = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    // elements[0] = n_groups * 128, wg_denoms = {128,1,1} → dispatches n_groups workgroups
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        { src0_buf, dst_buf },
+        pc,
+        { n_groups * 128, 1, 1 });
 }
 
 static void ggml_vk_unary(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
@@ -13030,6 +13092,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
     case GGML_OP_L2_NORM:
         ggml_vk_l2_norm(ctx, compute_ctx, src0, node);
+
+        break;
+    case GGML_OP_TURBO_WHT:
+        ggml_vk_turbo_wht(ctx, compute_ctx, src0, node);
 
         break;
     case GGML_OP_UNARY:
@@ -15331,6 +15397,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 case GGML_TYPE_F32:
                 case GGML_TYPE_Q4_0:
                 case GGML_TYPE_Q8_0:
+                case GGML_TYPE_TURBO3_0:
                     // supported in scalar and coopmat2 paths
                     break;
                 case GGML_TYPE_Q4_1:
@@ -15409,6 +15476,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_IQ4_NL:
+                    case GGML_TYPE_TURBO3_0:
                         return true;
                     default:
                         return false;
@@ -15574,6 +15642,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_PAD:
         case GGML_OP_ROLL:
             return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_TURBO_WHT:
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && op->src[0]->ne[0] % 128 == 0;
         case GGML_OP_DIAG_MASK_INF:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_SOFT_MAX:

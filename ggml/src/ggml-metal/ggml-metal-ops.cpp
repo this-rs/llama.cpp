@@ -2858,8 +2858,16 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         //}
 
         // simdgroups per threadgroup (a.k.a. warps)
-        //nsg = ne01 <= nqptg ? MAX(4, MIN(nsgmax, MIN(ne11/ncpsg, (int64_t) pipeline.maxTotalThreadsPerThreadgroup/32))) : 4;
-        int32_t nsg = ne00 >= 512 ? 8 : 4;
+        // Dynamically select nsg to maximize parallelism while staying within
+        // the 32KB threadgroup memory limit. Start at desired nsg and halve
+        // until SMEM fits. For turbo+dk>=512, nsg=4 gives 32KB (exactly at limit),
+        // nsg=2 gives 30KB (safe margin for Metal compiler internals).
+        int32_t nsg = (ne00 >= 512 && !is_q) ? 8 : 4;
+        // Leave 512B headroom for Metal compiler internal allocations (lookup tables, etc.)
+        const size_t smem_headroom = 512;
+        while (nsg > 1 && FATTN_SMEM(nsg) + smem_headroom > props_dev->max_theadgroup_memory_size) {
+            nsg /= 2;
+        }
 
         const size_t smem = FATTN_SMEM(nsg);
 

@@ -433,6 +433,59 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 }
 #endif
 
+// TurboQuant 3-bit dequantization (operates in WHT-rotated space — no inverse WHT needed)
+// Q is rotated by a separate TURBO_WHT op before FA, so <Q_rot, K_rot> = <Q, K>.
+// Each call dequantizes 2 or 4 elements: unpack 3-bit index → centroid lookup → ×norm
+#if defined(DATA_A_TURBO3_0)
+// 3-bit Lloyd-Max centroids for N(0, 1/128) — must match turbo-quant.cuh
+const float turbo3_centroids[8] = float[8](
+    -0.190685, -0.117832, -0.065717, -0.021460,
+     0.021460,  0.065717,  0.117832,  0.190685
+);
+
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    // iqs = element pair index within block (0..63), each call does 2 elements
+    // element indices: iqs*2 and iqs*2+1
+    const float norm = float(data_a[a_offset + ib].norm);
+    const uint e0 = iqs * 2u;
+    const uint e1 = e0 + 1u;
+
+    // Unpack 3-bit index for element e: low 2 bits from qs[e/4], high 1 bit from signs[e/8]
+    const uint8_t qb0 = data_a[a_offset + ib].qs[e0 / 4u];
+    const uint8_t qb1 = data_a[a_offset + ib].qs[e1 / 4u];
+    const uint8_t sb0 = data_a[a_offset + ib].signs[e0 / 8u];
+    const uint8_t sb1 = data_a[a_offset + ib].signs[e1 / 8u];
+
+    const uint idx0 = ((uint(qb0) >> ((e0 % 4u) * 2u)) & 0x3u) | (((uint(sb0) >> (e0 % 8u)) & 1u) << 2);
+    const uint idx1 = ((uint(qb1) >> ((e1 % 4u) * 2u)) & 0x3u) | (((uint(sb1) >> (e1 % 8u)) & 1u) << 2);
+
+    return vec2(turbo3_centroids[idx0], turbo3_centroids[idx1]) * norm;
+}
+
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    // iqs = element quad index within block, each call does 4 elements
+    // elements: iqs*4 .. iqs*4+3  →  one qs byte + part of one signs byte
+    const float norm = float(data_a[a_offset + ib].norm);
+    const uint base = iqs * 4u;
+
+    const uint8_t qb = data_a[a_offset + ib].qs[iqs]; // 4 elements packed in one byte
+    const uint8_t sb = data_a[a_offset + ib].signs[base / 8u];
+    const uint sshift = base % 8u;
+
+    const uint idx0 = ( uint(qb)       & 0x3u) | (((uint(sb) >> (sshift      )) & 1u) << 2);
+    const uint idx1 = ((uint(qb) >> 2) & 0x3u) | (((uint(sb) >> (sshift + 1u)) & 1u) << 2);
+    const uint idx2 = ((uint(qb) >> 4) & 0x3u) | (((uint(sb) >> (sshift + 2u)) & 1u) << 2);
+    const uint idx3 = ((uint(qb) >> 6) & 0x3u) | (((uint(sb) >> (sshift + 3u)) & 1u) << 2);
+
+    return vec4(
+        turbo3_centroids[idx0],
+        turbo3_centroids[idx1],
+        turbo3_centroids[idx2],
+        turbo3_centroids[idx3]
+    ) * norm;
+}
+#endif
+
 #if defined(DATA_A_F32) || defined(DATA_A_F16) || defined(DATA_A_BF16)
 vec2 get_dm(uint ib, uint a_offset) {
     return vec2(0, 0);
@@ -445,6 +498,13 @@ vec2 get_dm(uint ib, uint a_offset) {
     const u16vec4 s = u16vec4(scales[0], scales[1], scales[2], scales[3]) >> 12;
     const float d = float(unpackHalf2x16(s.x | (s.y << 4) | (s.z << 8) | (s.w << 12)).x);
     return vec2(d, 0);
+}
+#endif
+
+#if defined(DATA_A_TURBO3_0)
+vec2 get_dm(uint ib, uint a_offset) {
+    // Norm is already multiplied into the dequantized values
+    return vec2(1, 0);
 }
 #endif
 

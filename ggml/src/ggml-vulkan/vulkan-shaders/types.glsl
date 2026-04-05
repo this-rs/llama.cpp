@@ -1696,6 +1696,34 @@ struct block_mxfp4
 #define A_TYPE block_mxfp4
 #endif
 
+// TurboQuant 3-bit: PolarQuant with WHT rotation (128-element blocks)
+// block_turbo3_0 = {norm(fp16), qs[32](2-bit low), signs[16](1-bit high)} = 50 bytes per 128 values
+#define QUANT_K_TURBO3_0 128
+#define QUANT_R_TURBO3_0 1
+
+struct block_turbo3_0
+{
+    float16_t norm;
+    uint8_t qs[32];    // lower 2-bit indices, 4 per byte
+    uint8_t signs[16]; // upper 1-bit of 3-bit index, 8 per byte
+};
+
+// Packed16 layout for FA: 50 bytes = 1 x float16 norm + 16 x uint16 qs + 8 x uint16 signs = 25 uint16
+struct block_turbo3_0_packed16
+{
+    float16_t norm;       //  2 bytes
+    uint16_t  qs[16];     // 32 bytes (qs[32] repacked as uint16)
+    uint16_t  signs[8];   // 16 bytes (signs[16] repacked as uint16)
+};
+
+#if defined(DATA_A_TURBO3_0)
+#define QUANT_K QUANT_K_TURBO3_0
+#define QUANT_R QUANT_R_TURBO3_0
+#define QUANT_AUXF 1
+#define A_TYPE block_turbo3_0
+#define A_TYPE_PACKED16 block_turbo3_0_packed16
+#endif
+
 #if defined(DATA_A_IQ4_NL) || defined(DATA_A_IQ4_XS)
 const int8_t kvalues_iq4nl_const[16] = {
     int8_t(-127), int8_t(-104), int8_t(-83), int8_t(-65), int8_t(-49), int8_t(-35), int8_t(-22), int8_t(-10),
