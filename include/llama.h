@@ -1100,6 +1100,33 @@ extern "C" {
     LLAMA_API float * llama_get_embeddings_seq(struct llama_context * ctx, llama_seq_id seq_id);
 
     //
+    // layer output capture API [obrain]
+    // Capture intermediate hidden states at specific transformer layers during llama_decode.
+    // Useful for extracting per-layer representations without modifying the inference pipeline.
+    //
+
+    // Configure which layers to capture. Pass NULL/0 to disable.
+    // layer_indices: array of layer indices (0-based, max n_layer-1)
+    // n_layers: number of layers to capture
+    // Must be called before llama_decode. Triggers graph re-reserve.
+    LLAMA_API void llama_set_layer_output_capture(
+            struct llama_context * ctx,
+            const int32_t        * layer_indices,
+            int32_t                n_layers);
+
+    // Get captured layer output after llama_decode.
+    // Returns pointer to n_embd floats for the given layer and token index, or NULL.
+    // layer_idx: transformer layer index (must be one of the configured capture layers)
+    // i: token index in the batch (0-based)
+    LLAMA_API const float * llama_get_layer_output(
+            struct llama_context * ctx,
+            int32_t                layer_idx,
+            int32_t                i);
+
+    // Get the number of layers currently configured for capture.
+    LLAMA_API int32_t llama_layer_output_n_layers(struct llama_context * ctx);
+
+    //
     // backend sampling API [EXPERIMENTAL]
     // note: use only if the llama_context was created with at least one llama_sampler_seq_config
     //

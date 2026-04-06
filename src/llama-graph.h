@@ -616,6 +616,9 @@ struct llm_graph_params {
 
     uint32_t n_outputs;
 
+    // layer output capture [obrain] — which layer indices to preserve after graph compute
+    const std::vector<int32_t> * capture_layers = nullptr;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -675,6 +678,17 @@ struct llm_graph_params {
             }
         }
 
+        // capture_layers pointer change invalidates graph topology [obrain]
+        if (capture_layers != other.capture_layers) {
+            // different pointer — check contents
+            if (!capture_layers || !other.capture_layers) {
+                return false; // one is null, the other isn't
+            }
+            if (*capture_layers != *other.capture_layers) {
+                return false;
+            }
+        }
+
         return
             cparams.embeddings  == other.cparams.embeddings  &&
             cparams.causal_attn == other.cparams.causal_attn &&
@@ -729,6 +743,9 @@ public:
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
     std::map<llama_seq_id, ggml_tensor*> t_sampled;
     std::map<llama_seq_id, ggml_tensor*> t_sampled_probs;
+
+    // layer output capture [obrain] — tensor refs for target layers (set during graph build)
+    std::map<int32_t, ggml_tensor*> t_layer_out;
 
     std::vector<llm_graph_input_ptr> inputs;
 
@@ -826,6 +843,9 @@ struct llm_graph_context {
     mutable ggml_tensor * state_kq_b_tensor = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    // layer output capture [obrain]
+    const std::vector<int32_t> * capture_layers = nullptr;
 
     const llm_graph_cb & cb_func;
 

@@ -163,6 +163,11 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
+    // layer output capture [obrain]
+    void set_layer_output_capture(const int32_t * layer_indices, int32_t n_layers);
+    const float * get_layer_output(int32_t layer_idx, int32_t i);
+    int32_t layer_output_n_layers() const;
+
     // custom attention mask (position-indexed, AND logic with default mask)
     void set_attn_mask(const float * mask, const llama_pos * positions, int32_t n_pos,
                        int32_t n_head_groups, int32_t slot_id);
@@ -395,6 +400,10 @@ private:
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
     std::map<llama_seq_id, std::vector<float>> embd_seq;
+
+    // layer output capture [obrain]
+    std::vector<int32_t> capture_layer_indices;                    // which layers to capture
+    std::map<int32_t, std::vector<float>> layer_output_data;       // [layer_idx] → [n_tokens * n_embd]
 
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;

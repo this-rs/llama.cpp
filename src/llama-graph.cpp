@@ -804,6 +804,7 @@ void llm_graph_result::reset() {
     t_sampled_probs.clear();
     t_sampled_logits.clear();
     t_candidates.clear();
+    t_layer_out.clear();
 
     params = {};
 
@@ -951,6 +952,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     state_bias_n_head (params.state_bias_n_head),
     state_bias_n_kv   (params.state_bias_n_kv),
     samplers         (params.samplers),
+    capture_layers   (params.capture_layers),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),

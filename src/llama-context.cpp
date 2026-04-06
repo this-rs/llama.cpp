@@ -859,6 +859,49 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
     return it->second.data();
 }
 
+// layer output capture [obrain]
+
+void llama_context::set_layer_output_capture(const int32_t * layer_indices, int32_t n_layers) {
+    capture_layer_indices.clear();
+    layer_output_data.clear();
+
+    if (layer_indices && n_layers > 0) {
+        const int32_t nl = (int32_t)model.hparams.n_layer;
+        for (int32_t i = 0; i < n_layers; i++) {
+            if (layer_indices[i] >= 0 && layer_indices[i] < nl) {
+                capture_layer_indices.push_back(layer_indices[i]);
+            } else {
+                LLAMA_LOG_WARN("%s: ignoring invalid layer index %d (n_layer=%d)\n", __func__, layer_indices[i], nl);
+            }
+        }
+        LLAMA_LOG_INFO("%s: capturing %zu layer outputs\n", __func__, capture_layer_indices.size());
+    }
+
+    // force graph re-reserve since topology changes
+    sched_need_reserve = true;
+}
+
+const float * llama_context::get_layer_output(int32_t layer_idx, int32_t i) {
+    auto it = layer_output_data.find(layer_idx);
+    if (it == layer_output_data.end()) {
+        return nullptr;
+    }
+
+    const int64_t n_embd_val = model.hparams.n_embd;
+    const int64_t offset = (int64_t)i * n_embd_val;
+
+    if (offset + n_embd_val > (int64_t)it->second.size()) {
+        LLAMA_LOG_ERROR("%s: token index %d out of range for layer %d\n", __func__, i, layer_idx);
+        return nullptr;
+    }
+
+    return it->second.data() + offset;
+}
+
+int32_t llama_context::layer_output_n_layers() const {
+    return (int32_t)capture_layer_indices.size();
+}
+
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     output_reorder();
 
@@ -1976,6 +2019,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        // extract layer outputs [obrain]
+        if (!capture_layer_indices.empty() && !res->t_layer_out.empty()) {
+            const int64_t n_embd_val = hparams.n_embd;
+            for (const auto & [il, t_lo] : res->t_layer_out) {
+                if (!t_lo) continue;
+
+                ggml_backend_t backend_lo = ggml_backend_sched_get_tensor_backend(sched.get(), t_lo);
+                if (!backend_lo) {
+                    LLAMA_LOG_WARN("%s: no backend for layer output %d\n", __func__, il);
+                    continue;
+                }
+
+                // t_lo shape: [n_embd, n_tokens] for intermediate layers
+                //              [n_embd, n_outputs] for the last layer (after inp_out_ids filtering)
+                const int64_t n_tok = t_lo->ne[1];
+                auto & dst = layer_output_data[il];
+                dst.resize(n_tok * n_embd_val);
+                ggml_backend_tensor_get_async(backend_lo, t_lo, dst.data(), 0, n_tok * n_embd_val * sizeof(float));
+            }
+        }
+
         // Copy backend sampling output if this ubatch produced any sampling tensors.
         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
             const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
@@ -2340,6 +2404,7 @@ llm_graph_params llama_context::graph_params(
         /*.state_bias_n_kv   =*/ state_bias.n_kv,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
+        /*.capture_layers =*/ capture_layer_indices.empty() ? nullptr : &capture_layer_indices,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -3331,6 +3396,21 @@ float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     ctx->synchronize();
 
     return ctx->get_embeddings_seq(seq_id);
+}
+
+// layer output capture [obrain] — C API wrappers
+
+void llama_set_layer_output_capture(llama_context * ctx, const int32_t * layer_indices, int32_t n_layers) {
+    ctx->set_layer_output_capture(layer_indices, n_layers);
+}
+
+const float * llama_get_layer_output(llama_context * ctx, int32_t layer_idx, int32_t i) {
+    ctx->synchronize();
+    return ctx->get_layer_output(layer_idx, i);
+}
+
+int32_t llama_layer_output_n_layers(llama_context * ctx) {
+    return ctx->layer_output_n_layers();
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
