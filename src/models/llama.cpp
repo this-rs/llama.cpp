@@ -148,12 +148,15 @@ llm_build_llama<embed>::llm_build_llama(const llama_model & model, const llm_gra
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
-        // layer output capture [obrain] — mark target layers as graph outputs
+        // layer output capture [obrain] — copy target layer tensors so the
+        // scheduler cannot recycle their buffers (critical for GPU backends)
         if (capture_layers) {
             for (const auto & cl : *capture_layers) {
                 if (cl == il) {
-                    res->t_layer_out[il] = cur;
-                    ggml_build_forward_expand(gf, cur);
+                    ggml_tensor * copy = ggml_dup(ctx0, cur);
+                    cb(copy, "l_out_capture", il);
+                    res->t_layer_out[il] = copy;
+                    ggml_build_forward_expand(gf, copy);
                     break;
                 }
             }
