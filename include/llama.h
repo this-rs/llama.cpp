@@ -573,6 +573,11 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_head_kv  (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa      (const struct llama_model * model);
 
+    // Returns the number of recurrent (non-attention) layers in the model.
+    // For pure attention models (GPT, Llama, Qwen2, etc.) this returns 0.
+    // For hybrid models (Qwen3.5, Jamba, etc.) this returns > 0.
+    LLAMA_API int32_t llama_model_n_recurrent(const struct llama_model * model);
+
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
 
@@ -1125,6 +1130,94 @@ extern "C" {
 
     // Get the number of layers currently configured for capture.
     LLAMA_API int32_t llama_layer_output_n_layers(struct llama_context * ctx);
+
+    //
+    // Direct KV cache injection [EXPERIMENTAL]
+    //
+
+    // Inject pre-computed K and V data directly into the KV cache without running llama_decode.
+    // This allows populating the cache from externally predicted hidden states (e.g. ONNX translator).
+    //
+    // Parameters:
+    //   ctx       - the llama context
+    //   seq_id    - sequence ID to assign to injected cells
+    //   pos       - array of positions for each token [n_tokens]
+    //   k_data    - K data for ALL layers, contiguous: [n_layers][n_tokens][n_embd_k_gqa]
+    //               Data type must match the cache's K type (f16 by default).
+    //               Layers are in model order matching the KV cache layer mapping.
+    //   v_data    - V data for ALL layers, same layout as k_data but [n_layers][n_tokens][n_embd_v_gqa]
+    //   n_tokens  - number of tokens to inject
+    //   n_layers  - number of layers in k_data/v_data (must match KV cache layer count)
+    //
+    // Returns 0 on success, negative on error:
+    //   -1: invalid parameters
+    //   -2: no free slots in KV cache
+    //   -3: layer count mismatch
+    //
+    // Note: k_data and v_data must be in the KV cache's native type (see llama_kv_cache_type_k/v).
+    //       For f16 caches, provide ggml_fp16_t arrays. For quantized caches (q8_0, turbo),
+    //       the data must already be quantized.
+    LLAMA_API int32_t llama_kv_cache_inject(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+              const llama_pos    * pos,
+              const void         * k_data,
+              const void         * v_data,
+                        int32_t    n_tokens,
+                        int32_t    n_layers);
+
+    // Inject K/V data for a SINGLE layer. Useful when injecting layer-by-layer
+    // (e.g. from multi-layer ONNX predictions where each layer may have different quality).
+    //
+    // pos must have been previously registered via llama_kv_cache_inject_begin.
+    // k_data: [n_tokens][n_embd_k_gqa] in cache native type
+    // v_data: [n_tokens][n_embd_v_gqa] in cache native type
+    // layer_idx: model layer index (0-based)
+    LLAMA_API int32_t llama_kv_cache_inject_layer(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+              const llama_pos    * pos,
+              const void         * k_data,
+              const void         * v_data,
+                        int32_t    n_tokens,
+                        int32_t    layer_idx);
+
+    // Get the KV cache data type for keys
+    LLAMA_API enum ggml_type llama_kv_cache_type_k(const struct llama_context * ctx);
+
+    // Get the KV cache data type for values
+    LLAMA_API enum ggml_type llama_kv_cache_type_v(const struct llama_context * ctx);
+
+    // Project hidden states through the model's K/V weight matrices and inject
+    // directly into the KV cache. Handles RMSNorm, W_k/W_v matmul, K-norm
+    // (if present), RoPE, quantization — everything needed to go from a predicted
+    // hidden state to valid K/V cache entries.
+    //
+    // hidden_states: [n_tokens, n_embd] f32 — predicted hidden states
+    // pos:           [n_tokens]              — position IDs for RoPE
+    // layer_start:   first layer index (inclusive)
+    // layer_end:     last layer index (exclusive)
+    //
+    // The same hidden_states are projected for all layers in [layer_start, layer_end).
+    // Call once per layer group (e.g., hidden[0] for layers 0-8, hidden[8] for 8-16, etc.)
+    //
+    // Returns:
+    //    0: success
+    //   -1: invalid context (not a KV cache backend)
+    //   -2: invalid layer range
+    //   -3: cell allocation failed
+    LLAMA_API int32_t llama_kv_cache_project_hidden(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+              const llama_pos    * pos,
+              const float        * hidden_states,
+                        int32_t    n_tokens,
+                        int32_t    layer_start,
+                        int32_t    layer_end);
+
+    // Clear the dequantized weight cache used by project_hidden.
+    // Call this when unloading a model to free the cached f32 weights.
+    LLAMA_API void llama_kv_cache_clear_dequant_cache(struct llama_context * ctx);
 
     //
     // backend sampling API [EXPERIMENTAL]

@@ -67,6 +67,20 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
+        // layer output capture [obrain] — copy target layer tensors so the
+        // scheduler cannot recycle their buffers (critical for GPU backends)
+        if (capture_layers) {
+            for (const auto & cl : *capture_layers) {
+                if (cl == il) {
+                    ggml_tensor * copy = ggml_dup(ctx0, cur);
+                    cb(copy, "l_out_capture", il);
+                    res->t_layer_out[il] = copy;
+                    ggml_build_forward_expand(gf, copy);
+                    break;
+                }
+            }
+        }
+
         // Input for next layer
         inpL = cur;
     }

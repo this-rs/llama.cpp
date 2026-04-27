@@ -4,7 +4,11 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-cache.h"
+#include "llama-kv-cache-iswa.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -14,7 +18,51 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
+#include <unordered_map>
+
+#ifdef __APPLE__
+#include <Accelerate/Accelerate.h>
+#define HAVE_CBLAS 1
+#elif defined(GGML_USE_BLAS)
+#include <cblas.h>
+#define HAVE_CBLAS 1
+#endif
+
+// --- Dequantized weight cache for project_hidden ---
+// Caches f32 dequantized W_k, W_v, attn_norm, attn_k_norm per (model, layer).
+// Lazy-initialized on first call, avoids re-dequantizing on every project_hidden call.
+// Memory cost: ~3.5 MB per cached layer for 9B GQA model (negligible).
+
+struct dequant_layer_cache {
+    std::vector<float> wk_f32;       // [n_embd_k_gqa * n_embd]
+    std::vector<float> wv_f32;       // [n_embd_v_gqa * n_embd]
+    std::vector<float> norm_w;       // [n_embd]
+    std::vector<float> k_norm_w;     // [n_embd_head] or empty
+    std::vector<float> bk_f32;       // [n_embd_k_gqa] or empty (K bias)
+    std::vector<float> bv_f32;       // [n_embd_v_gqa] or empty (V bias)
+};
+
+struct dequant_cache_key {
+    const void * model_ptr;
+    int32_t      layer_idx;
+
+    bool operator==(const dequant_cache_key & other) const {
+        return model_ptr == other.model_ptr && layer_idx == other.layer_idx;
+    }
+};
+
+struct dequant_cache_key_hash {
+    size_t operator()(const dequant_cache_key & k) const {
+        size_t h = std::hash<const void *>{}(k.model_ptr);
+        h ^= std::hash<int32_t>{}(k.layer_idx) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+static std::mutex                                                                          g_dequant_cache_mutex;
+static std::unordered_map<dequant_cache_key, dequant_layer_cache, dequant_cache_key_hash>  g_dequant_cache;
 
 //
 // llama_context
@@ -3915,6 +3963,636 @@ void llama_memory_breakdown_print(const struct llama_context * ctx) {
             __func__, td[1].c_str(), td[2].c_str(), td[3].c_str(), td[4].c_str(), td[5].c_str(),
             td[6].c_str(), td[7].c_str(), td[8].c_str());
     }
+}
+
+//
+// KV cache injection
+//
+
+int32_t llama_kv_cache_inject(
+        struct llama_context * ctx,
+                llama_seq_id   seq_id,
+          const llama_pos    * pos,
+          const void         * k_data,
+          const void         * v_data,
+                    int32_t    n_tokens,
+                    int32_t    n_layers) {
+    auto * kv = dynamic_cast<llama_kv_cache *>(ctx->get_memory());
+    if (!kv) {
+        LLAMA_LOG_ERROR("%s: context does not use a KV cache memory backend\n", __func__);
+        return -1;
+    }
+    return kv->inject(seq_id, pos, k_data, v_data, n_tokens, n_layers);
+}
+
+int32_t llama_kv_cache_inject_layer(
+        struct llama_context * ctx,
+                llama_seq_id   seq_id,
+          const llama_pos    * pos,
+          const void         * k_data,
+          const void         * v_data,
+                    int32_t    n_tokens,
+                    int32_t    layer_idx) {
+    auto * kv = dynamic_cast<llama_kv_cache *>(ctx->get_memory());
+    if (!kv) {
+        LLAMA_LOG_ERROR("%s: context does not use a KV cache memory backend\n", __func__);
+        return -1;
+    }
+    return kv->inject_layer(seq_id, pos, k_data, v_data, n_tokens, layer_idx);
+}
+
+enum ggml_type llama_kv_cache_type_k(const struct llama_context * ctx) {
+    auto * kv = dynamic_cast<const llama_kv_cache *>(ctx->get_memory());
+    if (!kv) {
+        return GGML_TYPE_COUNT; // sentinel: not a KV cache
+    }
+    return kv->get_type_k();
+}
+
+enum ggml_type llama_kv_cache_type_v(const struct llama_context * ctx) {
+    auto * kv = dynamic_cast<const llama_kv_cache *>(ctx->get_memory());
+    if (!kv) {
+        return GGML_TYPE_COUNT; // sentinel: not a KV cache
+    }
+    return kv->get_type_v();
+}
+
+int32_t llama_kv_cache_project_hidden(
+        struct llama_context * ctx,
+                llama_seq_id   seq_id,
+          const llama_pos    * pos,
+          const float        * hidden_states,
+                    int32_t    n_tokens,
+                    int32_t    layer_start,
+                    int32_t    layer_end) {
+    // Resolve KV cache — supports all memory backend types:
+    //   1. llama_kv_cache              — plain, no SWA
+    //   2. llama_kv_cache_iswa         — SWA models (base + swa sub-caches)
+    //   3. llama_memory_hybrid         — hybrid models (attn kv_cache + recurrent)
+    //   4. llama_memory_hybrid_iswa    — hybrid + SWA (attn kv_cache_iswa + recurrent)
+    auto * mem = ctx->get_memory();
+    llama_kv_cache      * kv_plain = nullptr;
+    llama_kv_cache_iswa * kv_iswa  = nullptr;
+
+    // Try direct types first
+    kv_plain = dynamic_cast<llama_kv_cache *>(mem);
+    if (!kv_plain) {
+        kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(mem);
+    }
+    // Try hybrid wrappers
+    if (!kv_plain && !kv_iswa) {
+        auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
+        if (hybrid) {
+            kv_plain = hybrid->get_mem_attn();
+        }
+    }
+    if (!kv_plain && !kv_iswa) {
+        auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem);
+        if (hybrid_iswa) {
+            kv_iswa = hybrid_iswa->get_mem_attn();
+        }
+    }
+    if (!kv_plain && !kv_iswa) {
+        LLAMA_LOG_ERROR("%s: unsupported memory backend (type=%s)\n",
+                        __func__, mem ? typeid(*mem).name() : "null");
+        return -1;
+    }
+
+    const auto & model  = ctx->get_model();
+    const auto & hparams = model.hparams;
+    const int32_t n_layer = (int32_t)hparams.n_layer;
+    const int32_t n_embd  = (int32_t)hparams.n_embd;
+
+    // Lambda to get the correct kv_cache for a given layer
+    auto get_kv = [&](int32_t il) -> llama_kv_cache * {
+        if (kv_plain) return kv_plain;
+        return hparams.is_swa((uint32_t)il) ? kv_iswa->get_swa() : kv_iswa->get_base();
+    };
+
+    if (layer_start < 0 || layer_end > n_layer || layer_start >= layer_end) {
+        LLAMA_LOG_ERROR("%s: invalid layer range [%d, %d) for model with %d layers\n",
+                        __func__, layer_start, layer_end, n_layer);
+        return -2;
+    }
+
+    const float rms_norm_eps  = hparams.f_norm_rms_eps;
+    const auto  rope_type    = hparams.rope_type;
+
+    // Find the first attention (non-recurrent) layer in range for cell allocation
+    int32_t first_attn_layer = -1;
+    for (int32_t il = layer_start; il < layer_end; ++il) {
+        if (!hparams.is_recurrent((uint32_t)il)) {
+            first_attn_layer = il;
+            break;
+        }
+    }
+
+    if (first_attn_layer < 0) {
+        // All layers in range are recurrent — nothing to inject into KV cache
+        LLAMA_LOG_WARN("%s: all layers in [%d, %d) are recurrent, skipping\n",
+                       __func__, layer_start, layer_end);
+        return 0;
+    }
+
+    // Allocate KV cells via dummy inject on the first attention layer
+    {
+        auto * kv0 = get_kv(first_attn_layer);
+        const int32_t n_embd_k = (int32_t)hparams.n_embd_k_gqa((uint32_t)first_attn_layer);
+        const int32_t n_embd_v = (int32_t)hparams.n_embd_v_gqa((uint32_t)first_attn_layer);
+        const auto type_k = kv0->get_type_k();
+        const auto type_v = kv0->get_type_v();
+        const size_t k_row_size = ggml_row_size(type_k, n_embd_k);
+        const size_t v_row_size = ggml_row_size(type_v, n_embd_v);
+
+        std::vector<uint8_t> dummy_k(n_tokens * k_row_size, 0);
+        std::vector<uint8_t> dummy_v(n_tokens * v_row_size, 0);
+        int32_t ret = kv0->inject_layer(seq_id, pos, dummy_k.data(), dummy_v.data(),
+                                        n_tokens, first_attn_layer);
+        if (ret != 0) {
+            LLAMA_LOG_ERROR("%s: cell allocation failed at layer %d (ret=%d)\n",
+                            __func__, first_attn_layer, ret);
+            return -3;
+        }
+        // For iswa: also allocate cells in the other sub-cache
+        if (kv_iswa) {
+            auto * kv_other = hparams.is_swa((uint32_t)first_attn_layer)
+                            ? kv_iswa->get_base() : kv_iswa->get_swa();
+            for (int32_t il2 = layer_start; il2 < layer_end; ++il2) {
+                if (hparams.is_recurrent((uint32_t)il2)) continue;
+                if (get_kv(il2) == kv_other) {
+                    const int32_t n_ek2 = (int32_t)hparams.n_embd_k_gqa((uint32_t)il2);
+                    const int32_t n_ev2 = (int32_t)hparams.n_embd_v_gqa((uint32_t)il2);
+                    const size_t kr2 = ggml_row_size(kv_other->get_type_k(), n_ek2);
+                    const size_t vr2 = ggml_row_size(kv_other->get_type_v(), n_ev2);
+                    std::vector<uint8_t> dk2(n_tokens * kr2, 0);
+                    std::vector<uint8_t> dv2(n_tokens * vr2, 0);
+                    kv_other->inject_layer(seq_id, pos, dk2.data(), dv2.data(), n_tokens, il2);
+                    break;
+                }
+            }
+        }
+    }
+
+    // ── CPU dequant + CBLAS projection ──
+    // Dequantize model weights to f32 (cached), then project via BLAS GEMM.
+    // This approach is proven correct and fast with CBLAS (~100ms vs 17s scalar).
+    // Works on ALL platforms: macOS (Accelerate), Linux (OpenBLAS), any backend.
+    const int64_t t_start_us = ggml_time_us();
+
+    // Clear diag file at start of each top-level call
+    { FILE * f = fopen("/tmp/kv_project_diag.log", "w"); if (f) fclose(f); }
+
+    const auto & cparams    = ctx->get_cparams();
+    const float  freq_base  = cparams.rope_freq_base;
+    const float  freq_scale = cparams.rope_freq_scale;
+
+    int n_projected = 0;
+
+    for (int32_t il = layer_start; il < layer_end; ++il) {
+        if (hparams.is_recurrent((uint32_t)il)) {
+            continue;
+        }
+        const auto & layer = model.layers[il];
+        if (!layer.wk || !layer.wv || !layer.attn_norm) {
+            LLAMA_LOG_WARN("%s: layer %d missing wk/wv/attn_norm — skipping\n", __func__, il);
+            continue;
+        }
+
+        const int32_t il_n_embd_k_gqa = (int32_t)hparams.n_embd_k_gqa((uint32_t)il);
+        const int32_t il_n_embd_v_gqa = (int32_t)hparams.n_embd_v_gqa((uint32_t)il);
+        const int32_t il_n_head_kv    = (int32_t)hparams.n_head_kv((uint32_t)il);
+        const int32_t il_n_embd_head  = il_n_head_kv > 0 ? il_n_embd_k_gqa / il_n_head_kv : 0;
+        const int32_t il_n_rot        = (int32_t)hparams.n_rot((uint32_t)il);
+
+        // ── Get or populate dequantized weight cache ──
+        dequant_cache_key cache_key{ (const void *)&model, il };
+        dequant_layer_cache * dcache;
+        {
+            std::lock_guard<std::mutex> lock(g_dequant_cache_mutex);
+            auto & entry = g_dequant_cache[cache_key];
+            if (entry.wk_f32.empty()) {
+                // First call for this layer — dequantize weights from GPU/quantized tensors
+                entry.wk_f32.resize((size_t)il_n_embd_k_gqa * n_embd);
+                entry.wv_f32.resize((size_t)il_n_embd_v_gqa * n_embd);
+                entry.norm_w.resize(n_embd);
+
+                // Dequantize W_k
+                if (layer.wk->type == GGML_TYPE_F32) {
+                    ggml_backend_tensor_get(layer.wk, entry.wk_f32.data(), 0, entry.wk_f32.size() * sizeof(float));
+                } else {
+                    // Read raw quantized data, then dequantize to f32
+                    const size_t raw_size = ggml_nbytes(layer.wk);
+                    std::vector<uint8_t> raw(raw_size);
+                    ggml_backend_tensor_get(layer.wk, raw.data(), 0, raw_size);
+                    const auto * traits = ggml_get_type_traits(layer.wk->type);
+                    const int64_t nrows = layer.wk->ne[1]; // n_embd_k_gqa rows
+                    const int64_t ncols = layer.wk->ne[0]; // n_embd cols per row
+                    const size_t row_size_q = ggml_row_size(layer.wk->type, ncols);
+                    for (int64_t r = 0; r < nrows; r++) {
+                        traits->to_float(raw.data() + r * row_size_q,
+                                        entry.wk_f32.data() + r * ncols,
+                                        ncols);
+                    }
+                }
+
+                // Dequantize W_v
+                if (layer.wv->type == GGML_TYPE_F32) {
+                    ggml_backend_tensor_get(layer.wv, entry.wv_f32.data(), 0, entry.wv_f32.size() * sizeof(float));
+                } else {
+                    const size_t raw_size = ggml_nbytes(layer.wv);
+                    std::vector<uint8_t> raw(raw_size);
+                    ggml_backend_tensor_get(layer.wv, raw.data(), 0, raw_size);
+                    const auto * traits = ggml_get_type_traits(layer.wv->type);
+                    const int64_t nrows = layer.wv->ne[1];
+                    const int64_t ncols = layer.wv->ne[0];
+                    const size_t row_size_q = ggml_row_size(layer.wv->type, ncols);
+                    for (int64_t r = 0; r < nrows; r++) {
+                        traits->to_float(raw.data() + r * row_size_q,
+                                        entry.wv_f32.data() + r * ncols,
+                                        ncols);
+                    }
+                }
+
+                // Dequantize attn_norm weights
+                if (layer.attn_norm->type == GGML_TYPE_F32) {
+                    ggml_backend_tensor_get(layer.attn_norm, entry.norm_w.data(), 0, n_embd * sizeof(float));
+                } else {
+                    const size_t raw_size = ggml_nbytes(layer.attn_norm);
+                    std::vector<uint8_t> raw(raw_size);
+                    ggml_backend_tensor_get(layer.attn_norm, raw.data(), 0, raw_size);
+                    ggml_get_type_traits(layer.attn_norm->type)->to_float(raw.data(), entry.norm_w.data(), n_embd);
+                }
+
+                // Optional K-norm (Llama4, Qwen3.5)
+                if (layer.attn_k_norm) {
+                    const int32_t knorm_size = il_n_embd_head;
+                    entry.k_norm_w.resize(knorm_size);
+                    if (layer.attn_k_norm->type == GGML_TYPE_F32) {
+                        ggml_backend_tensor_get(layer.attn_k_norm, entry.k_norm_w.data(), 0, knorm_size * sizeof(float));
+                    } else {
+                        const size_t raw_size = ggml_nbytes(layer.attn_k_norm);
+                        std::vector<uint8_t> raw(raw_size);
+                        ggml_backend_tensor_get(layer.attn_k_norm, raw.data(), 0, raw_size);
+                        ggml_get_type_traits(layer.attn_k_norm->type)->to_float(raw.data(), entry.k_norm_w.data(), knorm_size);
+                    }
+                }
+
+                // Optional K/V bias (Qwen, etc.)
+                if (layer.bk) {
+                    entry.bk_f32.resize(il_n_embd_k_gqa);
+                    if (layer.bk->type == GGML_TYPE_F32) {
+                        ggml_backend_tensor_get(layer.bk, entry.bk_f32.data(), 0, il_n_embd_k_gqa * sizeof(float));
+                    } else {
+                        const size_t raw_size = ggml_nbytes(layer.bk);
+                        std::vector<uint8_t> raw(raw_size);
+                        ggml_backend_tensor_get(layer.bk, raw.data(), 0, raw_size);
+                        ggml_get_type_traits(layer.bk->type)->to_float(raw.data(), entry.bk_f32.data(), il_n_embd_k_gqa);
+                    }
+                }
+                if (layer.bv) {
+                    entry.bv_f32.resize(il_n_embd_v_gqa);
+                    if (layer.bv->type == GGML_TYPE_F32) {
+                        ggml_backend_tensor_get(layer.bv, entry.bv_f32.data(), 0, il_n_embd_v_gqa * sizeof(float));
+                    } else {
+                        const size_t raw_size = ggml_nbytes(layer.bv);
+                        std::vector<uint8_t> raw(raw_size);
+                        ggml_backend_tensor_get(layer.bv, raw.data(), 0, raw_size);
+                        ggml_get_type_traits(layer.bv->type)->to_float(raw.data(), entry.bv_f32.data(), il_n_embd_v_gqa);
+                    }
+                }
+
+                LLAMA_LOG_DEBUG("%s: cached dequantized weights for layer %d (wk: %dx%d, wv: %dx%d, bk: %s, bv: %s)\n",
+                               __func__, il, il_n_embd_k_gqa, n_embd, il_n_embd_v_gqa, n_embd,
+                               layer.bk ? "yes" : "no", layer.bv ? "yes" : "no");
+            }
+            dcache = &entry;
+        }
+
+        // ── Step 1: RMSNorm on CPU ──
+        // For each token: norm(x) = x / sqrt(mean(x²) + eps) * weight
+        std::vector<float> normed((size_t)n_tokens * n_embd);
+        for (int t = 0; t < n_tokens; t++) {
+            const float * x = hidden_states + t * n_embd;
+            float * y = normed.data() + t * n_embd;
+            // Compute RMS
+            float sum_sq = 0.0f;
+            for (int i = 0; i < n_embd; i++) sum_sq += x[i] * x[i];
+            const float rms_inv = 1.0f / sqrtf(sum_sq / n_embd + rms_norm_eps);
+            // Normalize and scale by weight
+            for (int i = 0; i < n_embd; i++) {
+                y[i] = x[i] * rms_inv * dcache->norm_w[i];
+            }
+        }
+
+        // ── Step 2: GEMM — K = normed × W_k^T, V = normed × W_v^T ──
+        // normed: [n_tokens, n_embd] (row-major)
+        // W_k:    [n_embd_k_gqa, n_embd] (row-major, as dequantized from ggml col-major ne[0]=n_embd, ne[1]=n_embd_k_gqa)
+        // Result: K [n_tokens, n_embd_k_gqa]
+        std::vector<float> k_f32((size_t)n_tokens * il_n_embd_k_gqa);
+        std::vector<float> v_f32((size_t)n_tokens * il_n_embd_v_gqa);
+
+#ifdef HAVE_CBLAS
+        // K = normed × W_k^T  →  C[M,N] = A[M,K] × B[K,N]^T  (CblasTrans on B)
+        // But W_k is stored as [n_embd_k_gqa, n_embd] row-major = [n_embd_k_gqa rows × n_embd cols]
+        // We want: result[t, j] = sum_i normed[t, i] * W_k[j, i]
+        // = normed[M=n_tokens, K=n_embd] × W_k^T[K=n_embd, N=n_embd_k_gqa]
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    n_tokens, il_n_embd_k_gqa, n_embd,
+                    1.0f,
+                    normed.data(), n_embd,
+                    dcache->wk_f32.data(), n_embd,
+                    0.0f,
+                    k_f32.data(), il_n_embd_k_gqa);
+
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    n_tokens, il_n_embd_v_gqa, n_embd,
+                    1.0f,
+                    normed.data(), n_embd,
+                    dcache->wv_f32.data(), n_embd,
+                    0.0f,
+                    v_f32.data(), il_n_embd_v_gqa);
+#else
+        // Scalar fallback (slow but correct)
+        for (int t = 0; t < n_tokens; t++) {
+            const float * src = normed.data() + t * n_embd;
+            float * dk = k_f32.data() + t * il_n_embd_k_gqa;
+            float * dv = v_f32.data() + t * il_n_embd_v_gqa;
+            for (int j = 0; j < il_n_embd_k_gqa; j++) {
+                float acc = 0.0f;
+                const float * wrow = dcache->wk_f32.data() + j * n_embd;
+                for (int i = 0; i < n_embd; i++) acc += src[i] * wrow[i];
+                dk[j] = acc;
+            }
+            for (int j = 0; j < il_n_embd_v_gqa; j++) {
+                float acc = 0.0f;
+                const float * wrow = dcache->wv_f32.data() + j * n_embd;
+                for (int i = 0; i < n_embd; i++) acc += src[i] * wrow[i];
+                dv[j] = acc;
+            }
+        }
+#endif
+
+        // ── Step 2b: Add K/V bias (Qwen, etc.) ──
+        if (!dcache->bk_f32.empty()) {
+            for (int t = 0; t < n_tokens; t++) {
+                float * dk = k_f32.data() + t * il_n_embd_k_gqa;
+                for (int j = 0; j < il_n_embd_k_gqa; j++) {
+                    dk[j] += dcache->bk_f32[j];
+                }
+            }
+        }
+        if (!dcache->bv_f32.empty()) {
+            for (int t = 0; t < n_tokens; t++) {
+                float * dv = v_f32.data() + t * il_n_embd_v_gqa;
+                for (int j = 0; j < il_n_embd_v_gqa; j++) {
+                    dv[j] += dcache->bv_f32[j];
+                }
+            }
+        }
+
+        // ── Step 3: Optional K-norm (Llama4, Qwen3.5) ──
+        // MUST come BEFORE RoPE: the forward pass does K = K-norm(wk × cur) → RoPE(K).
+        // K-norm weights are learned per dimension in the unrotated basis.
+        // Applying them after RoPE would apply weights to wrong (rotated) dimensions → garbage.
+        if (!dcache->k_norm_w.empty() && il_n_head_kv > 0) {
+            for (int t = 0; t < n_tokens; t++) {
+                for (int h = 0; h < il_n_head_kv; h++) {
+                    float * head = k_f32.data() + t * il_n_embd_k_gqa + h * il_n_embd_head;
+                    float sum_sq = 0.0f;
+                    for (int i = 0; i < il_n_embd_head; i++) sum_sq += head[i] * head[i];
+                    const float rms_inv = 1.0f / sqrtf(sum_sq / il_n_embd_head + rms_norm_eps);
+                    for (int i = 0; i < il_n_embd_head; i++) {
+                        head[i] = head[i] * rms_inv * dcache->k_norm_w[i];
+                    }
+                }
+            }
+        }
+
+        // ── Step 4: RoPE on K ──
+        // K layout after GEMM + K-norm: [n_tokens, n_embd_k_gqa] row-major
+        // = [n_tokens, n_head_kv, n_embd_head] logically
+        // RoPE rotates the first n_rot dimensions of each head.
+        // Must match ggml_rope_ext behavior: NORM pairs (d, d+1), NEOX pairs (d, d+half).
+        if (il_n_rot > 0 && il_n_head_kv > 0 && rope_type != LLAMA_ROPE_TYPE_NONE) {
+            const bool is_neox = (rope_type == LLAMA_ROPE_TYPE_NEOX  ||
+                                  rope_type == LLAMA_ROPE_TYPE_MROPE ||
+                                  rope_type == LLAMA_ROPE_TYPE_IMROPE);
+            const int half_rot = il_n_rot / 2;
+
+            for (int t = 0; t < n_tokens; t++) {
+                const float p = (float)pos[t];
+                for (int h = 0; h < il_n_head_kv; h++) {
+                    float * head = k_f32.data() + t * il_n_embd_k_gqa + h * il_n_embd_head;
+
+                    if (is_neox) {
+                        // NEOX / MROPE: pairs are (d, d + n_rot/2)
+                        // theta_d = pos * freq_base^(-2d / n_rot) * freq_scale
+                        for (int d = 0; d < half_rot; d++) {
+                            const float theta = p * powf(freq_base, -(float)(2 * d) / (float)il_n_rot) * freq_scale;
+                            const float cos_t = cosf(theta);
+                            const float sin_t = sinf(theta);
+                            const float x0 = head[d];
+                            const float x1 = head[d + half_rot];
+                            head[d]            = x0 * cos_t - x1 * sin_t;
+                            head[d + half_rot] = x0 * sin_t + x1 * cos_t;
+                        }
+                    } else {
+                        // NORMAL: pairs are (d, d+1) for d=0,2,4,...
+                        // theta_d = pos * freq_base^(-d / n_rot) * freq_scale
+                        for (int d = 0; d < il_n_rot; d += 2) {
+                            const float theta = p * powf(freq_base, -(float)d / (float)il_n_rot) * freq_scale;
+                            const float cos_t = cosf(theta);
+                            const float sin_t = sinf(theta);
+                            const float x0 = head[d];
+                            const float x1 = head[d + 1];
+                            head[d]     = x0 * cos_t - x1 * sin_t;
+                            head[d + 1] = x0 * sin_t + x1 * cos_t;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── DIAGNOSTIC: write stats to /tmp/kv_project_diag.log for EVERY group's first layer ──
+        if (il == layer_start && n_tokens > 0) {
+            // Input hidden state
+            float h_min = hidden_states[0], h_max = hidden_states[0], h_sum = 0;
+            for (int i = 0; i < n_embd; i++) {
+                h_min = std::min(h_min, hidden_states[i]);
+                h_max = std::max(h_max, hidden_states[i]);
+                h_sum += hidden_states[i];
+            }
+            // Normed hidden (after RMSNorm)
+            float n_min = normed[0], n_max = normed[0], n_sum = 0;
+            for (int i = 0; i < n_embd; i++) {
+                n_min = std::min(n_min, normed[i]);
+                n_max = std::max(n_max, normed[i]);
+                n_sum += normed[i];
+            }
+            // K after full pipeline (RMSNorm + GEMM + bias + K-norm + RoPE)
+            float k_min = k_f32[0], k_max = k_f32[0], k_sum = 0, k_sq = 0;
+            int k_nan = 0, k_inf = 0;
+            for (int i = 0; i < il_n_embd_k_gqa; i++) {
+                if (std::isnan(k_f32[i])) k_nan++;
+                if (std::isinf(k_f32[i])) k_inf++;
+                k_min = std::min(k_min, k_f32[i]);
+                k_max = std::max(k_max, k_f32[i]);
+                k_sum += k_f32[i];
+                k_sq  += k_f32[i] * k_f32[i];
+            }
+            // V after full pipeline
+            float v_min = v_f32[0], v_max = v_f32[0], v_sum = 0, v_sq = 0;
+            int v_nan = 0, v_inf = 0;
+            for (int i = 0; i < il_n_embd_v_gqa; i++) {
+                if (std::isnan(v_f32[i])) v_nan++;
+                if (std::isinf(v_f32[i])) v_inf++;
+                v_min = std::min(v_min, v_f32[i]);
+                v_max = std::max(v_max, v_f32[i]);
+                v_sum += v_f32[i];
+                v_sq  += v_f32[i] * v_f32[i];
+            }
+
+            // Check if layer is recurrent
+            bool layer_is_recurrent = hparams.is_recurrent((uint32_t)il);
+
+            // Count recurrent vs attention layers in the full model
+            int n_recurrent = 0, n_attention = 0;
+            for (int l = 0; l < n_layer; l++) {
+                if (hparams.is_recurrent((uint32_t)l)) n_recurrent++;
+                else n_attention++;
+            }
+
+            // Write to file — append mode so all groups accumulate
+            FILE * f = fopen("/tmp/kv_project_diag.log", "a");
+            if (f) {
+                fprintf(f, "=== project_hidden DIAG — layer_start=%d layer_end=%d n_tokens=%d ===\n", layer_start, layer_end, n_tokens);
+                fprintf(f, "  model: n_embd=%d n_layer=%d n_attention=%d n_recurrent=%d\n", n_embd, n_layer, n_attention, n_recurrent);
+                fprintf(f, "  layer %d: n_embd_k_gqa=%d n_embd_v_gqa=%d n_head_kv=%d n_embd_head=%d n_rot=%d\n",
+                        il, il_n_embd_k_gqa, il_n_embd_v_gqa, il_n_head_kv, il_n_embd_head, il_n_rot);
+                fprintf(f, "  rope_type=%d is_neox=%s freq_base=%.1f freq_scale=%.6f\n",
+                        (int)rope_type,
+                        (rope_type == LLAMA_ROPE_TYPE_NEOX || rope_type == LLAMA_ROPE_TYPE_MROPE || rope_type == LLAMA_ROPE_TYPE_IMROPE) ? "yes" : "no",
+                        freq_base, freq_scale);
+                fprintf(f, "  has_bk=%s has_bv=%s has_knorm=%s is_recurrent=%s\n",
+                        dcache->bk_f32.empty() ? "no" : "yes",
+                        dcache->bv_f32.empty() ? "no" : "yes",
+                        dcache->k_norm_w.empty() ? "no" : "yes",
+                        layer_is_recurrent ? "YES(!)" : "no");
+                fprintf(f, "  kv type_k=%d type_v=%d\n",
+                        (int)get_kv(il)->get_type_k(), (int)get_kv(il)->get_type_v());
+                fprintf(f, "  hidden[0]:  min=%.4f max=%.4f mean=%.4f\n", h_min, h_max, h_sum / n_embd);
+                fprintf(f, "  normed[0]:  min=%.4f max=%.4f mean=%.4f\n", n_min, n_max, n_sum / n_embd);
+                fprintf(f, "  K[0]:       min=%.4f max=%.4f mean=%.4f rms=%.4f nan=%d inf=%d\n",
+                        k_min, k_max, k_sum / il_n_embd_k_gqa, sqrtf(k_sq / il_n_embd_k_gqa), k_nan, k_inf);
+                fprintf(f, "              first8=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n",
+                        k_f32[0], k_f32[1], k_f32[2], k_f32[3], k_f32[4], k_f32[5], k_f32[6], k_f32[7]);
+                fprintf(f, "  V[0]:       min=%.4f max=%.4f mean=%.4f rms=%.4f nan=%d inf=%d\n",
+                        v_min, v_max, v_sum / il_n_embd_v_gqa, sqrtf(v_sq / il_n_embd_v_gqa), v_nan, v_inf);
+                fprintf(f, "              first8=[%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n",
+                        v_f32[0], v_f32[1], v_f32[2], v_f32[3], v_f32[4], v_f32[5], v_f32[6], v_f32[7]);
+                fprintf(f, "  pos[0]=%d pos[last]=%d\n", pos[0], pos[n_tokens - 1]);
+                // Norm weights sample
+                fprintf(f, "  norm_w first4=[%.4f,%.4f,%.4f,%.4f]\n",
+                        dcache->norm_w[0], dcache->norm_w[1], dcache->norm_w[2], dcache->norm_w[3]);
+                if (!dcache->k_norm_w.empty()) {
+                    fprintf(f, "  k_norm_w first4=[%.4f,%.4f,%.4f,%.4f]\n",
+                            dcache->k_norm_w[0], dcache->k_norm_w[1], dcache->k_norm_w[2], dcache->k_norm_w[3]);
+                }
+                // Wk weight sample (first row, first 4 elements)
+                fprintf(f, "  wk[0] first4=[%.6f,%.6f,%.6f,%.6f]\n",
+                        dcache->wk_f32[0], dcache->wk_f32[1], dcache->wk_f32[2], dcache->wk_f32[3]);
+                fprintf(f, "\n");
+                fclose(f);
+            }
+
+            LLAMA_LOG_INFO("%s: [DIAG] layer %d — wrote diagnostics to /tmp/kv_project_diag.log\n", __func__, il);
+        }
+
+        // ── Step 5: Quantize and inject into KV cache ──
+        auto * kv = get_kv(il);
+        const auto type_k = kv->get_type_k();
+        const auto type_v = kv->get_type_v();
+
+        // Quantize K
+        std::vector<uint8_t> k_quantized;
+        const void * k_ptr;
+        if (type_k == GGML_TYPE_F32) {
+            k_ptr = k_f32.data();
+        } else if (type_k == GGML_TYPE_F16) {
+            k_quantized.resize(n_tokens * il_n_embd_k_gqa * sizeof(ggml_fp16_t));
+            ggml_fp16_t * dst = (ggml_fp16_t *)k_quantized.data();
+            for (size_t i = 0; i < k_f32.size(); i++) dst[i] = ggml_fp32_to_fp16(k_f32[i]);
+            k_ptr = k_quantized.data();
+        } else {
+            const size_t row_size = ggml_row_size(type_k, il_n_embd_k_gqa);
+            k_quantized.resize(n_tokens * row_size);
+            const auto * traits = ggml_get_type_traits(type_k);
+            if (traits && traits->from_float_ref) {
+                for (int t = 0; t < n_tokens; t++) {
+                    traits->from_float_ref(k_f32.data() + t * il_n_embd_k_gqa,
+                                       k_quantized.data() + t * row_size,
+                                       il_n_embd_k_gqa);
+                }
+            }
+            k_ptr = k_quantized.data();
+        }
+
+        // Quantize V
+        std::vector<uint8_t> v_quantized;
+        const void * v_ptr;
+        if (type_v == GGML_TYPE_F32) {
+            v_ptr = v_f32.data();
+        } else if (type_v == GGML_TYPE_F16) {
+            v_quantized.resize(n_tokens * il_n_embd_v_gqa * sizeof(ggml_fp16_t));
+            ggml_fp16_t * dst = (ggml_fp16_t *)v_quantized.data();
+            for (size_t i = 0; i < v_f32.size(); i++) dst[i] = ggml_fp32_to_fp16(v_f32[i]);
+            v_ptr = v_quantized.data();
+        } else {
+            const size_t row_size = ggml_row_size(type_v, il_n_embd_v_gqa);
+            v_quantized.resize(n_tokens * row_size);
+            const auto * traits = ggml_get_type_traits(type_v);
+            if (traits && traits->from_float_ref) {
+                for (int t = 0; t < n_tokens; t++) {
+                    traits->from_float_ref(v_f32.data() + t * il_n_embd_v_gqa,
+                                       v_quantized.data() + t * row_size,
+                                       il_n_embd_v_gqa);
+                }
+            }
+            v_ptr = v_quantized.data();
+        }
+
+        int32_t ret = kv->inject_layer(seq_id, pos, k_ptr, v_ptr, n_tokens, il);
+        if (ret != 0) {
+            LLAMA_LOG_ERROR("%s: inject_layer failed for layer %d (ret=%d)\n", __func__, il, ret);
+            return -3;
+        }
+        n_projected++;
+    }
+
+    const int64_t t_end_us = ggml_time_us();
+#ifdef HAVE_CBLAS
+    const char * gemm_label = "CBLAS";
+#else
+    const char * gemm_label = "scalar";
+#endif
+    LLAMA_LOG_INFO("%s: projected %d layers in %.1f ms (%s GEMM)\n",
+                   __func__, n_projected, (t_end_us - t_start_us) / 1000.0, gemm_label);
+
+    return 0;
+}
+
+void llama_kv_cache_clear_dequant_cache(struct llama_context * ctx) {
+    std::lock_guard<std::mutex> lock(g_dequant_cache_mutex);
+    const void * model_ptr = (const void *)&ctx->get_model();
+    // Erase all entries matching this model
+    for (auto it = g_dequant_cache.begin(); it != g_dequant_cache.end(); ) {
+        if (it->first.model_ptr == model_ptr) {
+            it = g_dequant_cache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    LLAMA_LOG_INFO("%s: cleared dequantized weight cache\n", __func__);
 }
 
 //

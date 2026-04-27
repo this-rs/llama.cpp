@@ -9003,6 +9003,16 @@ int32_t llama_model_n_swa(const llama_model * model) {
     return model->hparams.n_swa;
 }
 
+int32_t llama_model_n_recurrent(const llama_model * model) {
+    int32_t count = 0;
+    for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
+        if (model->hparams.is_recurrent(il)) {
+            count++;
+        }
+    }
+    return count;
+}
+
 uint32_t llama_model_n_cls_out(const struct llama_model * model) {
     return model->hparams.n_cls_out;
 }

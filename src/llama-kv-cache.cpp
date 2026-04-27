@@ -2679,6 +2679,256 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 }
 
 //
+// llama_kv_cache::inject
+//
+
+int32_t llama_kv_cache::inject(
+        llama_seq_id     seq_id,
+        const llama_pos * pos,
+        const void      * k_data,
+        const void      * v_data,
+        int32_t           n_tokens,
+        int32_t           n_layers_in) {
+    if (!pos || !k_data || !v_data || n_tokens <= 0 || seq_id < 0) {
+        LLAMA_LOG_ERROR("%s: invalid parameters\n", __func__);
+        return -1;
+    }
+
+    if ((uint32_t) n_layers_in != layers.size()) {
+        LLAMA_LOG_ERROR("%s: layer count mismatch (%d vs %zu)\n", __func__, n_layers_in, layers.size());
+        return -3;
+    }
+
+    // Step 1: Build a ubatch for the tokens we want to inject
+    llama_batch_allocr balloc(hparams.n_pos_per_embd());
+    llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens, 1);
+
+    ubatch.seq_id_unq[0] = seq_id;
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        ubatch.pos[i]      = pos[i];
+        ubatch.n_seq_id[i] = 1;
+        ubatch.seq_id[i]   = &ubatch.seq_id_unq[0];
+    }
+
+    // Step 2: Find free slots in the cache
+    slot_info sinfo = find_slot(ubatch, false);
+    if (sinfo.empty()) {
+        LLAMA_LOG_ERROR("%s: no free slots for %d tokens\n", __func__, n_tokens);
+        return -2;
+    }
+
+    // Step 3: Register cells (pos + seq_id metadata)
+    apply_ubatch(sinfo, ubatch);
+
+    // Step 4: Write K and V data for each layer
+    const uint32_t strm = sinfo.s0;
+
+    for (uint32_t li = 0; li < layers.size(); ++li) {
+        const auto & layer = layers[li];
+
+        auto * k_tensor = layer.k_stream[strm];
+        auto * v_tensor = layer.v_stream[strm];
+
+        // K: [n_embd_k_gqa, kv_size] row-major — each row is one cell
+        const size_t k_row_size = ggml_row_size(k_tensor->type, k_tensor->ne[0]);
+        const auto * k_src = (const uint8_t *) k_data + li * (size_t) n_tokens * k_row_size;
+
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            const uint32_t cell_idx = sinfo.idxs[0][i];
+            const size_t dst_offset = cell_idx * k_row_size;
+            ggml_backend_tensor_set(k_tensor, k_src + i * k_row_size, dst_offset, k_row_size);
+        }
+
+        // V: layout depends on v_trans flag
+        if (!v_trans) {
+            // Same as K: [n_embd_v_gqa, kv_size] row-major
+            const size_t v_row_size = ggml_row_size(v_tensor->type, v_tensor->ne[0]);
+            const auto * v_src = (const uint8_t *) v_data + li * (size_t) n_tokens * v_row_size;
+
+            for (int32_t i = 0; i < n_tokens; ++i) {
+                const uint32_t cell_idx = sinfo.idxs[0][i];
+                const size_t dst_offset = cell_idx * v_row_size;
+                ggml_backend_tensor_set(v_tensor, v_src + i * v_row_size, dst_offset, v_row_size);
+            }
+        } else {
+            // Transposed: [kv_size, n_embd_v_gqa] — element-interleaved
+            // v_data is provided in logical order: [n_tokens][n_embd_v_gqa]
+            // We need to scatter each element to (cell_idx + j * kv_size)
+            const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(layer.il);
+            const size_t v_size_el = ggml_type_size(v_tensor->type);
+            const uint32_t kv_size = v_cells[strm].size();
+
+            // v_data for this layer: [n_tokens * n_embd_v_gqa] elements
+            const size_t layer_v_stride = (size_t) n_tokens * n_embd_v_gqa * v_size_el;
+            const auto * v_src = (const uint8_t *) v_data + li * layer_v_stride;
+
+            for (int32_t i = 0; i < n_tokens; ++i) {
+                const uint32_t cell_idx = sinfo.idxs[0][i];
+                for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                    const size_t src_offset = (i * n_embd_v_gqa + j) * v_size_el;
+                    const size_t dst_offset = (cell_idx + j * kv_size) * v_size_el;
+                    ggml_backend_tensor_set(v_tensor, v_src + src_offset, dst_offset, v_size_el);
+                }
+            }
+        }
+    }
+
+    LLAMA_LOG_DEBUG("%s: injected %d tokens into seq_id=%d (%zu layers)\n",
+        __func__, n_tokens, seq_id, layers.size());
+
+    return 0;
+}
+
+int32_t llama_kv_cache::inject_layer(
+        llama_seq_id     seq_id,
+        const llama_pos * pos,
+        const void      * k_data,
+        const void      * v_data,
+        int32_t           n_tokens,
+        int32_t           layer_idx) {
+    if (!pos || !k_data || !v_data || n_tokens <= 0 || seq_id < 0) {
+        LLAMA_LOG_ERROR("%s: invalid parameters\n", __func__);
+        return -1;
+    }
+
+    // Map model layer index to KV cache layer index
+    auto it = map_layer_ids.find(layer_idx);
+    if (it == map_layer_ids.end()) {
+        LLAMA_LOG_ERROR("%s: layer %d not found in KV cache\n", __func__, layer_idx);
+        return -1;
+    }
+    const uint32_t li = it->second;
+
+    // Build ubatch and allocate cells
+    llama_batch_allocr balloc(hparams.n_pos_per_embd());
+    llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens, 1);
+
+    ubatch.seq_id_unq[0] = seq_id;
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        ubatch.pos[i]      = pos[i];
+        ubatch.n_seq_id[i] = 1;
+        ubatch.seq_id[i]   = &ubatch.seq_id_unq[0];
+    }
+
+    // For single-layer inject, we need the cells to already exist OR find new ones.
+    // Check if cells at these positions already exist for this seq_id
+    const uint32_t strm = (seq_id < (int32_t) seq_to_stream.size()) ? seq_to_stream[seq_id] : 0;
+    auto & cells = v_cells[strm];
+
+    // Try to find existing cells for these positions
+    slot_info sinfo;
+    bool cells_exist = true;
+    std::vector<uint32_t> existing_idxs;
+
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        bool found = false;
+        for (uint32_t c = 0; c < cells.size(); ++c) {
+            if (cells.pos_get(c) == pos[i] && cells.seq_has(c, seq_id)) {
+                existing_idxs.push_back(c);
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            cells_exist = false;
+            break;
+        }
+    }
+
+    if (cells_exist) {
+        // Use existing cell allocations
+        sinfo.s0 = strm;
+        sinfo.s1 = strm;
+        sinfo.resize(1);
+        sinfo.strm[0] = strm;
+        sinfo.idxs[0] = existing_idxs;
+    } else {
+        // Allocate new cells
+        sinfo = find_slot(ubatch, false);
+        if (sinfo.empty()) {
+            LLAMA_LOG_ERROR("%s: no free slots for %d tokens\n", __func__, n_tokens);
+            return -2;
+        }
+        apply_ubatch(sinfo, ubatch);
+    }
+
+    // Write K data
+    const auto & layer = layers[li];
+    auto * k_tensor = layer.k_stream[sinfo.s0];
+    const size_t k_row_size = ggml_row_size(k_tensor->type, k_tensor->ne[0]);
+
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        const uint32_t cell_idx = sinfo.idxs[0][i];
+        const size_t dst_offset = cell_idx * k_row_size;
+        ggml_backend_tensor_set(k_tensor, (const uint8_t *) k_data + i * k_row_size, dst_offset, k_row_size);
+    }
+
+    // Write V data
+    auto * v_tensor = layer.v_stream[sinfo.s0];
+    if (!v_trans) {
+        const size_t v_row_size = ggml_row_size(v_tensor->type, v_tensor->ne[0]);
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            const uint32_t cell_idx = sinfo.idxs[0][i];
+            const size_t dst_offset = cell_idx * v_row_size;
+            ggml_backend_tensor_set(v_tensor, (const uint8_t *) v_data + i * v_row_size, dst_offset, v_row_size);
+        }
+    } else {
+        // v_trans: V tensor layout is [kv_size, n_embd_v_gqa] transposed.
+        // Instead of n_tokens × n_embd_v_gqa individual ggml_backend_tensor_set calls (2 bytes each!),
+        // we transpose into a column-major buffer on CPU, then write one chunk per column.
+        // This reduces GPU round-trips from O(n_tokens × n_embd) to O(n_embd).
+        const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(layer.il);
+        const size_t v_size_el = ggml_type_size(v_tensor->type);
+        const uint32_t kv_size = cells.size();
+
+        // Check if cells are contiguous (common case after fresh allocation)
+        bool contiguous = (n_tokens > 1);
+        uint32_t cell_min = sinfo.idxs[0][0];
+        uint32_t cell_max = sinfo.idxs[0][0];
+        for (int32_t i = 1; i < n_tokens && contiguous; ++i) {
+            if (sinfo.idxs[0][i] != sinfo.idxs[0][i - 1] + 1) {
+                contiguous = false;
+            }
+            cell_min = std::min(cell_min, sinfo.idxs[0][i]);
+            cell_max = std::max(cell_max, sinfo.idxs[0][i]);
+        }
+
+        if (contiguous) {
+            // Fast path: cells are contiguous — transpose on CPU, write one stripe per V dimension.
+            // Each stripe: kv_size stride, n_tokens consecutive elements starting at cell_min.
+            const uint32_t c0 = sinfo.idxs[0][0];
+            for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                // Build contiguous column: gather element j from each token
+                std::vector<uint8_t> col_buf(n_tokens * v_size_el);
+                for (int32_t i = 0; i < n_tokens; ++i) {
+                    memcpy(col_buf.data() + i * v_size_el,
+                           (const uint8_t *) v_data + (i * n_embd_v_gqa + j) * v_size_el,
+                           v_size_el);
+                }
+                const size_t dst_offset = (c0 + j * kv_size) * v_size_el;
+                ggml_backend_tensor_set(v_tensor, col_buf.data(), dst_offset, n_tokens * v_size_el);
+            }
+        } else {
+            // Slow path: non-contiguous cells — still batch per column to reduce calls.
+            // n_embd_v_gqa calls instead of n_tokens × n_embd_v_gqa.
+            for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                for (int32_t i = 0; i < n_tokens; ++i) {
+                    const uint32_t cell_idx = sinfo.idxs[0][i];
+                    const size_t src_offset = (i * n_embd_v_gqa + j) * v_size_el;
+                    const size_t dst_offset = (cell_idx + j * kv_size) * v_size_el;
+                    ggml_backend_tensor_set(v_tensor, (const uint8_t *) v_data + src_offset, dst_offset, v_size_el);
+                }
+            }
+        }
+    }
+
+    LLAMA_LOG_DEBUG("%s: injected %d tokens into layer %d (seq_id=%d)\n",
+        __func__, n_tokens, layer_idx, seq_id);
+
+    return 0;
+}
+
+//
 // llama_kv_cache_context
 //
 

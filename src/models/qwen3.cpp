@@ -98,6 +98,19 @@ llm_build_qwen3::llm_build_qwen3(const llama_model & model, const llm_graph_para
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
+        // layer output capture [obrain]
+        if (capture_layers) {
+            for (const auto & cl : *capture_layers) {
+                if (cl == il) {
+                    ggml_tensor * copy = ggml_dup(ctx0, cur);
+                    cb(copy, "l_out_capture", il);
+                    res->t_layer_out[il] = copy;
+                    ggml_build_forward_expand(gf, copy);
+                    break;
+                }
+            }
+        }
+
         // input for next layer
         inpL = cur;
     }

@@ -320,6 +320,29 @@ private:
 
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
+
+public:
+    // Direct KV cache injection — write pre-computed K/V data without llama_decode
+    // Returns 0 on success, negative on error
+    int32_t inject(
+            llama_seq_id     seq_id,
+            const llama_pos * pos,
+            const void      * k_data,  // [n_layers][n_tokens][n_embd_k_gqa] in cache native type
+            const void      * v_data,  // [n_layers][n_tokens][n_embd_v_gqa] in cache native type
+            int32_t           n_tokens,
+            int32_t           n_layers);
+
+    // Inject K/V for a single layer (uses existing cell allocation from prior inject or find_slot)
+    int32_t inject_layer(
+            llama_seq_id     seq_id,
+            const llama_pos * pos,
+            const void      * k_data,  // [n_tokens][n_embd_k_gqa]
+            const void      * v_data,  // [n_tokens][n_embd_v_gqa]
+            int32_t           n_tokens,
+            int32_t           layer_idx);
+
+    ggml_type get_type_k() const { return layers.empty() ? GGML_TYPE_F16 : layers[0].k->type; }
+    ggml_type get_type_v() const { return layers.empty() ? GGML_TYPE_F16 : layers[0].v->type; }
 };
 
 class llama_kv_cache_context : public llama_memory_context_i {
