@@ -4121,32 +4121,32 @@ int32_t llama_kv_cache_project_hidden(
                 }
 
                 // Optional K/V bias (Qwen, etc.)
-                if (layer.bk) {
+                if (layer.wk_b) {
                     entry.bk_f32.resize(il_n_embd_k_gqa);
-                    if (layer.bk->type == GGML_TYPE_F32) {
-                        ggml_backend_tensor_get(layer.bk, entry.bk_f32.data(), 0, il_n_embd_k_gqa * sizeof(float));
+                    if (layer.wk_b->type == GGML_TYPE_F32) {
+                        ggml_backend_tensor_get(layer.wk_b, entry.bk_f32.data(), 0, il_n_embd_k_gqa * sizeof(float));
                     } else {
-                        const size_t raw_size = ggml_nbytes(layer.bk);
+                        const size_t raw_size = ggml_nbytes(layer.wk_b);
                         std::vector<uint8_t> raw(raw_size);
-                        ggml_backend_tensor_get(layer.bk, raw.data(), 0, raw_size);
-                        ggml_get_type_traits(layer.bk->type)->to_float(raw.data(), entry.bk_f32.data(), il_n_embd_k_gqa);
+                        ggml_backend_tensor_get(layer.wk_b, raw.data(), 0, raw_size);
+                        ggml_get_type_traits(layer.wk_b->type)->to_float(raw.data(), entry.bk_f32.data(), il_n_embd_k_gqa);
                     }
                 }
-                if (layer.bv) {
+                if (layer.wv_b) {
                     entry.bv_f32.resize(il_n_embd_v_gqa);
-                    if (layer.bv->type == GGML_TYPE_F32) {
-                        ggml_backend_tensor_get(layer.bv, entry.bv_f32.data(), 0, il_n_embd_v_gqa * sizeof(float));
+                    if (layer.wv_b->type == GGML_TYPE_F32) {
+                        ggml_backend_tensor_get(layer.wv_b, entry.bv_f32.data(), 0, il_n_embd_v_gqa * sizeof(float));
                     } else {
-                        const size_t raw_size = ggml_nbytes(layer.bv);
+                        const size_t raw_size = ggml_nbytes(layer.wv_b);
                         std::vector<uint8_t> raw(raw_size);
-                        ggml_backend_tensor_get(layer.bv, raw.data(), 0, raw_size);
-                        ggml_get_type_traits(layer.bv->type)->to_float(raw.data(), entry.bv_f32.data(), il_n_embd_v_gqa);
+                        ggml_backend_tensor_get(layer.wv_b, raw.data(), 0, raw_size);
+                        ggml_get_type_traits(layer.wv_b->type)->to_float(raw.data(), entry.bv_f32.data(), il_n_embd_v_gqa);
                     }
                 }
 
                 LLAMA_LOG_DEBUG("%s: cached dequantized weights for layer %d (wk: %dx%d, wv: %dx%d, bk: %s, bv: %s)\n",
                                __func__, il, il_n_embd_k_gqa, n_embd, il_n_embd_v_gqa, n_embd,
-                               layer.bk ? "yes" : "no", layer.bv ? "yes" : "no");
+                               layer.wk_b ? "yes" : "no", layer.wv_b ? "yes" : "no");
             }
             dcache = &entry;
         }
