@@ -4101,18 +4101,47 @@ int32_t llama_kv_cache_extract_layer(
     return kv->extract_layer(seq_id, pos, k_data, v_data, n_tokens, layer_idx);
 }
 
+// [obrain] Resolve the attention KV cache's dtype for BOTH plain and hybrid
+// memory backends. The original version only handled `llama_kv_cache`
+// directly — for hybrid models (attention + recurrent/SSM layers, e.g.
+// Qwen3.5-MoE / Qwen3.6's Gated DeltaNet mix), `ctx->get_memory()` returns
+// a `llama_memory_hybrid` wrapping the real attention cache, so the naive
+// dynamic_cast always failed and silently returned the GGML_TYPE_COUNT
+// sentinel — even though a real attention KV cache genuinely exists.
+// Discovered live: this broke `kv_layer_block_size_bytes`'s size
+// computation (reported ~25TB per layer) and, downstream,
+// `llama_kv_cache_inject_layer`'s size validation (rejected every
+// correctly-sized buffer). Mirrors `resolve_kv_for_inject` above, which
+// already handles this correctly for extract/inject — type queries had
+// been missed.
+static const llama_kv_cache * resolve_kv_for_type_query(const llama_context * ctx) {
+    auto * mem = ctx->get_memory();
+    if (!mem) {
+        return nullptr;
+    }
+    if (auto * kv = dynamic_cast<const llama_kv_cache *>(mem)) {
+        return kv;
+    }
+    if (auto * hybrid = dynamic_cast<const llama_memory_hybrid *>(mem)) {
+        return hybrid->get_mem_attn();
+    }
+    // hybrid_iswa or plain iswa: not handled here (same limitation as
+    // resolve_kv_for_inject) — caller gets the sentinel.
+    return nullptr;
+}
+
 enum ggml_type llama_kv_cache_type_k(const struct llama_context * ctx) {
-    auto * kv = dynamic_cast<const llama_kv_cache *>(ctx->get_memory());
+    auto * kv = resolve_kv_for_type_query(ctx);
     if (!kv) {
-        return GGML_TYPE_COUNT; // sentinel: not a KV cache
+        return GGML_TYPE_COUNT; // sentinel: not a (resolvable) KV cache
     }
     return kv->get_type_k();
 }
 
 enum ggml_type llama_kv_cache_type_v(const struct llama_context * ctx) {
-    auto * kv = dynamic_cast<const llama_kv_cache *>(ctx->get_memory());
+    auto * kv = resolve_kv_for_type_query(ctx);
     if (!kv) {
-        return GGML_TYPE_COUNT; // sentinel: not a KV cache
+        return GGML_TYPE_COUNT; // sentinel: not a (resolvable) KV cache
     }
     return kv->get_type_v();
 }
