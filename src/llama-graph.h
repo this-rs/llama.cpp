@@ -622,6 +622,23 @@ struct llm_graph_params {
     // layer output capture [obrain] — which layer indices to preserve after graph compute
     const std::vector<int32_t> * capture_layers = nullptr;
 
+    // post-attn-norm capture [obrain B1a] — captures h_normed (input to W_Q/W_K/W_V projection)
+    const std::vector<int32_t> * capture_attn_norm_layers = nullptr;
+
+    // layer output OVERRIDE [obrain multi-layer geometry-of-meaning steering]
+    // — if non-null, each layer index in `*override_layers` has its output
+    // (the residual-stream value that becomes the next layer's input)
+    // substituted with a graph input tensor instead of the naturally
+    // computed value. Originally built (single layer) so callers could
+    // probe "what would the final logits be if this layer's output were X"
+    // via finite differences (g^out at an intermediate layer); extended to
+    // a SET of layers to support distributing a steering nudge across
+    // several layers at once (a single-layer nudge strong enough to be
+    // durable was found live to destroy output coherence — see PO plan
+    // 4749fb72, task P3-T6/relief-map).
+    // nullptr = no override (default, no graph-topology impact).
+    const std::vector<int32_t> * override_layers = nullptr;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -692,6 +709,27 @@ struct llm_graph_params {
             }
         }
 
+        // capture_attn_norm_layers similarly invalidates graph topology [obrain B1a]
+        if (capture_attn_norm_layers != other.capture_attn_norm_layers) {
+            if (!capture_attn_norm_layers || !other.capture_attn_norm_layers) {
+                return false;
+            }
+            if (*capture_attn_norm_layers != *other.capture_attn_norm_layers) {
+                return false;
+            }
+        }
+
+        // override_layers change invalidates graph topology [obrain multi-layer]
+        // (adding/removing/moving any override input tensor changes the graph)
+        if (override_layers != other.override_layers) {
+            if (!override_layers || !other.override_layers) {
+                return false; // one is null, the other isn't
+            }
+            if (*override_layers != *other.override_layers) {
+                return false;
+            }
+        }
+
         return
             cparams.embeddings  == other.cparams.embeddings  &&
             cparams.causal_attn == other.cparams.causal_attn &&
@@ -749,6 +787,17 @@ public:
 
     // layer output capture [obrain] — tensor refs for target layers (set during graph build)
     std::map<int32_t, ggml_tensor*> t_layer_out;
+
+    // post-attn-norm capture [obrain B1a] — tensor refs at attn_norm output (h_normed)
+    std::map<int32_t, ggml_tensor*> t_attn_norm_out;
+
+    // layer output override [obrain multi-layer geometry-of-meaning steering]
+    // — graph input tensor(s) substituted for each overridden layer's
+    // output, one per layer in params.override_layers (set during graph
+    // build, filled with real values after graph allocation, before
+    // compute — same lifecycle as other graph inputs). Mirrors t_layer_out
+    // above (capture side) — a map keyed by layer index.
+    std::map<int32_t, ggml_tensor*> t_layer_override_inp;
 
     std::vector<llm_graph_input_ptr> inputs;
 
@@ -855,6 +904,12 @@ struct llm_graph_context {
 
     // layer output capture [obrain]
     const std::vector<int32_t> * capture_layers = nullptr;
+
+    // post-attn-norm capture [obrain B1a]
+    const std::vector<int32_t> * capture_attn_norm_layers = nullptr;
+
+    // layer output override [obrain multi-layer geometry-of-meaning steering]
+    const std::vector<int32_t> * override_layers = nullptr;
 
     const llm_graph_cb & cb_func;
 

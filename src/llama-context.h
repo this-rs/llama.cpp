@@ -158,6 +158,22 @@ struct llama_context {
     const float * get_layer_output(int32_t layer_idx, int32_t i);
     int32_t layer_output_n_layers() const;
 
+    // post-attn-norm capture [obrain B1a] — captures h_normed (input to W_Q/W_K/W_V)
+    void set_attn_norm_capture(const int32_t * layer_indices, int32_t n_layers);
+    const float * get_attn_norm(int32_t layer_idx, int32_t i);
+    int32_t attn_norm_n_layers() const;
+
+    // layer output OVERRIDE [obrain H1 multi-layer] — substitute layer
+    // `layer_idx`'s output with `data` (n_floats floats, copied internally;
+    // must equal n_tokens * n_embd for the NEXT decode's batch) during the
+    // next forward pass. Pass layer_idx=-1 to disable.
+    void set_layer_output_override(int32_t layer_idx, const float * data, int32_t n_floats);
+    void set_layer_output_override_multi(
+            const int32_t       * layer_indices,
+            const float * const * data,
+            const int32_t       * n_floats_per_layer,
+            int32_t               n_overrides);
+
     // custom attention mask (position-indexed, AND logic with default mask)
     void set_attn_mask(const float * mask, const llama_pos * positions, int32_t n_pos,
                        int32_t n_head_groups, int32_t slot_id);
@@ -394,6 +410,16 @@ private:
     // layer output capture [obrain]
     std::vector<int32_t> capture_layer_indices;                    // which layers to capture
     std::map<int32_t, std::vector<float>> layer_output_data;       // [layer_idx] → [n_tokens * n_embd]
+
+    // layer output override [obrain multi-layer geometry-of-meaning steering]
+    // — a SET of layers, each with its own override buffer, all applied
+    // simultaneously within one llama_decode's forward pass.
+    std::vector<int32_t> override_layer_indices;                      // which layers to override (sorted)
+    std::map<int32_t, std::vector<float>> override_layer_data_by_layer; // [layer_idx] -> [n_tokens * n_embd] floats
+
+    // post-attn-norm capture [obrain B1a]
+    std::vector<int32_t> capture_attn_norm_indices;                // which layers to capture h_normed
+    std::map<int32_t, std::vector<float>> attn_norm_data;          // [layer_idx] → [n_tokens * n_embd]
 
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;

@@ -575,6 +575,80 @@ extern "C" {
         int32_t             n_tokens,
         float             * output);
 
+    // [obrain] J-space geometric analysis (pullback metric g^out = J^T J of the
+    // readout) — readout = output_norm (RMSNorm) -> output (linear) -> softmax.
+    // Both accessors dequantize on read (ggml_get_type_traits(...)->to_float),
+    // same pattern as llama_model_get_mean_token_embedding above, and read via
+    // ggml_backend_tensor_get so they work regardless of backend (CPU/Metal/CUDA).
+
+    // Get the final RMSNorm gain (output_norm.weight), always small (n_embd) and
+    // in practice F32, but dequantized generically regardless.
+    // `output`: pre-allocated float buffer of size n_embd.
+    // Returns n_embd on success, -1 on failure (null model/tensor).
+    LLAMA_API int32_t llama_model_get_output_norm_weight(
+        const struct llama_model * model,
+        float                    * output);
+
+    // Compute the Gram matrix W_out^T @ W_out (n_embd x n_embd, row-major) of the
+    // readout projection (output.weight, shape [n_embd, n_vocab] in ggml layout).
+    // Streams over the n_vocab rows WITHOUT ever materializing the full
+    // [n_vocab, n_embd] dequantized matrix in memory (output.weight is commonly
+    // quantized and can be hundreds of MiB to a few GiB dequantized).
+    // This Gram matrix is independent of any activation h — callers should
+    // compute it ONCE and reuse it for every g^out(h) = J_rmsnorm(h)^T @ gram @
+    // J_rmsnorm(h) evaluation, never recompute it per-activation.
+    // `output_gram`: pre-allocated float buffer of size n_embd*n_embd.
+    // Returns n_embd on success, -1 on failure (null model/tensor).
+    LLAMA_API int32_t llama_model_get_output_gram_matrix(
+        const struct llama_model * model,
+        float                    * output_gram);
+
+    // [obrain] H4 — readout forward pass: given an arbitrary pre-output_norm
+    // hidden state `h` (e.g. a real captured activation, or h perturbed by
+    // some delta), compute the REAL logits that the readout would produce:
+    //   y      = rmsnorm(h) * output_norm.weight
+    //   logits = output.weight @ y
+    // This lets callers measure the TRUE softmax/KL effect of a perturbation
+    // to h, as ground truth to validate the g^out pullback-metric prediction
+    // q(delta) = delta^T g^out(h) delta against. Streams over the n_vocab
+    // rows (same dequant-on-read pattern as the Gram matrix above) but is
+    // O(n_vocab * n_embd), not O(n_vocab * n_embd^2) — cheap enough to call
+    // per-perturbation, unlike the Gram matrix (call once, cache).
+    // `h`: input buffer of size n_embd. `logits_out`: pre-allocated buffer of
+    // size n_vocab. Returns n_vocab on success, -1 on failure.
+    LLAMA_API int32_t llama_model_readout_forward(
+        const struct llama_model * model,
+        const float               * h,
+        float                     * logits_out);
+
+    // [obrain] Fisher/KL pullback support — computes a TOP-K-weighted
+    // Gram-like matrix M = sum_{v in top-k of p} p_v * w_v @ w_v^T (row-major
+    // n_embd x n_embd) and the corresponding weighted mean vector
+    // mean = sum_{v in top-k of p} p_v * w_v (length n_embd), where w_v is
+    // row v of output.weight and p is a probability distribution over the
+    // vocabulary (e.g. softmax(logits(h))).
+    //
+    // Used to build the Fisher/KL pullback metric g^out_KL(h) = J^T (diag(p)
+    // - p p^T) J, whose weighted-Gram middle term DEPENDS ON h (unlike the
+    // Euclidean g^out's plain Gram matrix above, which is a model constant)
+    // — hence this streams only the top-k highest-probability rows (a
+    // well-justified approximation: low-probability tokens contribute
+    // negligibly to a peaked next-token distribution's Fisher metric)
+    // rather than the full vocabulary, keeping the per-activation cost
+    // tractable (~k/n_vocab times the cost of the full Gram matrix above).
+    //
+    // `p`: array of length n_vocab (probabilities, need not be pre-sorted).
+    // `k`: number of top-probability tokens to include (partial-sorted internally).
+    // `weighted_gram_out`: pre-allocated buffer of size n_embd*n_embd.
+    // `weighted_mean_out`: pre-allocated buffer of size n_embd.
+    // Returns n_embd on success, -1 on failure.
+    LLAMA_API int32_t llama_model_get_weighted_gram_topk(
+        const struct llama_model * model,
+        const float               * p,
+        int32_t                     k,
+        float                     * weighted_gram_out,
+        float                     * weighted_mean_out);
+
     // Returns the number of classifier outputs (only valid for classifier models)
     // Undefined behavior for non-classifier models
     LLAMA_API uint32_t llama_model_n_cls_out(const struct llama_model * model);
@@ -1112,6 +1186,87 @@ extern "C" {
     // Get the number of layers currently configured for capture.
     LLAMA_API int32_t llama_layer_output_n_layers(struct llama_context * ctx);
 
+    // [obrain H1 multi-layer] layer output OVERRIDE — substitute layer
+    // `layer_idx`'s output (the residual-stream value that becomes the
+    // input to the NEXT layer) with `data` during the next llama_decode,
+    // so the remaining layers process this substituted value instead of
+    // what they'd naturally compute. Lets callers estimate the Jacobian of
+    // "everything from layer `layer_idx` to the final logits" via finite
+    // differences (perturb `data`, observe the resulting logits change) —
+    // the prerequisite for computing g^out at an INTERMEDIATE layer, not
+    // just the last one (where the readout Jacobian has the simple closed
+    // form RMSNorm + matmul, see llama_model_readout_forward above).
+    //
+    // `data`: n_floats floats, copied internally (caller can free after this
+    // call returns) — must equal (n_tokens * n_embd) for the batch passed to
+    // the NEXT llama_decode call, since the override tensor matches the
+    // layer's FULL output shape [n_embd, n_tokens], not just [n_embd]. For
+    // multi-token batches, callers should fill every token's slice with
+    // that token's own NATURAL value (e.g. obtained via
+    // llama_set_layer_output_capture on a prior decode) except the specific
+    // position(s) actually being perturbed — otherwise unperturbed
+    // positions read uninitialized memory and corrupt the whole batch.
+    // `layer_idx`: pass -1 to disable/clear the override. Only ONE override
+    // active at a time (single layer). Must be called before llama_decode.
+    // Triggers graph re-reserve when the override LAYER changes (not when
+    // only its values change).
+    LLAMA_API void llama_set_layer_output_override(
+            struct llama_context * ctx,
+            int32_t                 layer_idx,
+            const float            * data,
+            int32_t                  n_floats);
+
+    // [obrain multi-layer geometry-of-meaning] Override MULTIPLE layers'
+    // outputs SIMULTANEOUSLY during the next llama_decode — distributes a
+    // steering nudge across several layers instead of concentrating it at
+    // one. Motivated by a live finding: a single-layer nudge strong enough
+    // to durably redirect a factual claim (surviving the model's own
+    // self-correction across many generated tokens) destroys output
+    // coherence, while a weaker single-layer nudge gets self-corrected —
+    // no working middle ground was found on one layer alone. Spreading a
+    // moderate nudge over several layers is the standard remedy in the
+    // activation-steering literature.
+    //
+    // Shares the SAME underlying override state as
+    // llama_set_layer_output_override — calling either one replaces
+    // whatever set of overrides was previously active (they are not
+    // additive across calls).
+    //
+    // layer_indices: array of `n_overrides` layer indices (0-based)
+    // data: array of `n_overrides` pointers; data[k] holds
+    //   n_floats_per_layer[k] floats for layer_indices[k], same sizing
+    //   rule as llama_set_layer_output_override (n_tokens * n_embd for the
+    //   NEXT llama_decode's batch — natural values everywhere except the
+    //   perturbed position(s), see that function's docs).
+    // n_floats_per_layer: array of `n_overrides` counts, one per layer.
+    // n_overrides: number of (layer, data) pairs. Pass 0 (or NULL
+    //   arrays) to clear all overrides.
+    // Data is copied internally (caller can free after this call
+    // returns). Must be called before llama_decode. Triggers graph
+    // re-reserve when the SET of overridden layers changes (not when only
+    // the values change).
+    LLAMA_API void llama_set_layer_output_override_multi(
+            struct llama_context  * ctx,
+            const int32_t          * layer_indices,
+            const float * const    * data,
+            const int32_t          * n_floats_per_layer,
+            int32_t                  n_overrides);
+
+    // [obrain B1a] post-attn-norm capture: dump h_normed (input to W_Q/W_K/W_V).
+    // Useful to derive Q ourselves: Q = RoPE(q_norm(W_Q · h_normed)).
+    LLAMA_API void llama_set_attn_norm_capture(
+            struct llama_context * ctx,
+            const int32_t        * layer_indices,
+            int32_t                n_layers);
+
+    // Get captured attn_norm output for a layer & token index. Returns n_embd floats or NULL.
+    LLAMA_API const float * llama_get_attn_norm(
+            struct llama_context * ctx,
+            int32_t                layer_idx,
+            int32_t                i);
+
+    LLAMA_API int32_t llama_attn_norm_n_layers(struct llama_context * ctx);
+
     //
     // Direct KV cache injection [EXPERIMENTAL]
     //
@@ -1160,6 +1315,27 @@ extern "C" {
               const llama_pos    * pos,
               const void         * k_data,
               const void         * v_data,
+                        int32_t    n_tokens,
+                        int32_t    layer_idx);
+
+    // Extract K/V data for a SINGLE layer at given positions (mirror of inject_layer).
+    //
+    // The cells at (pos, seq_id) must already exist in the cache (i.e. populated by a
+    // prior real prefill via llama_decode/llama_encode, or via inject*). Useful for:
+    //   1. Producing per-layer oracle K/V to train a student model that predicts K/V
+    //      directly (option for prefill-bypass via inject_layer).
+    //   2. Demonstrating byte-exact prefill bypass: extract from one seq, inject into
+    //      another, generate, compare to direct generation from the source seq.
+    //
+    // Buffer layouts mirror inject_layer:
+    //   k_data: [n_tokens][n_embd_k_gqa] in cache native type
+    //   v_data: [n_tokens][n_embd_v_gqa] in cache native type
+    LLAMA_API int32_t llama_kv_cache_extract_layer(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+              const llama_pos    * pos,
+                    void         * k_data,
+                    void         * v_data,
                         int32_t    n_tokens,
                         int32_t    layer_idx);
 

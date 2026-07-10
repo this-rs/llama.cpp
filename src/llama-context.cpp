@@ -952,6 +952,101 @@ int32_t llama_context::layer_output_n_layers() const {
     return (int32_t)capture_layer_indices.size();
 }
 
+// layer output override [obrain multi-layer geometry-of-meaning steering]
+
+void llama_context::set_layer_output_override(int32_t layer_idx, const float * data, int32_t n_floats) {
+    if (layer_idx < 0 || !data || n_floats <= 0) {
+        set_layer_output_override_multi(nullptr, nullptr, nullptr, 0);
+        return;
+    }
+    const float * data_arr[1] = { data };
+    const int32_t n_floats_arr[1] = { n_floats };
+    set_layer_output_override_multi(&layer_idx, data_arr, n_floats_arr, 1);
+}
+
+void llama_context::set_layer_output_override_multi(
+        const int32_t       * layer_indices,
+        const float * const * data,
+        const int32_t       * n_floats_per_layer,
+        int32_t                n_overrides) {
+    std::vector<int32_t> new_indices;
+    std::map<int32_t, std::vector<float>> new_data;
+
+    if (layer_indices && data && n_floats_per_layer && n_overrides > 0) {
+        const int32_t nl = (int32_t) model.hparams.n_layer;
+        for (int32_t k = 0; k < n_overrides; k++) {
+            const int32_t li = layer_indices[k];
+            if (li < 0 || li >= nl) {
+                LLAMA_LOG_WARN("%s: ignoring invalid layer index %d (n_layer=%d)\n", __func__, li, nl);
+                continue;
+            }
+            if (!data[k] || n_floats_per_layer[k] <= 0) {
+                LLAMA_LOG_WARN("%s: ignoring layer %d with empty override data\n", __func__, li);
+                continue;
+            }
+            // Caller is responsible for sizing this correctly: n_tokens *
+            // n_embd for the NEXT llama_decode's batch, per layer (each
+            // layer's override tensor matches `cur`'s full
+            // [n_embd, n_tokens, n_seqs] shape at THAT point in the graph —
+            // same rule as the single-layer version, applied per layer).
+            new_data[li].assign(data[k], data[k] + n_floats_per_layer[k]);
+            new_indices.push_back(li);
+        }
+    }
+
+    std::sort(new_indices.begin(), new_indices.end());
+    const bool topology_changed = (new_indices != override_layer_indices);
+    override_layer_indices = std::move(new_indices);
+    override_layer_data_by_layer = std::move(new_data);
+
+    if (topology_changed) {
+        sched_need_reserve = true; // force graph re-reserve since topology changes
+    }
+}
+
+// post-attn-norm capture [obrain B1a]
+
+void llama_context::set_attn_norm_capture(const int32_t * layer_indices, int32_t n_layers) {
+    capture_attn_norm_indices.clear();
+    attn_norm_data.clear();
+
+    if (layer_indices && n_layers > 0) {
+        const int32_t nl = (int32_t)model.hparams.n_layer;
+        for (int32_t i = 0; i < n_layers; i++) {
+            if (layer_indices[i] >= 0 && layer_indices[i] < nl) {
+                capture_attn_norm_indices.push_back(layer_indices[i]);
+            } else {
+                LLAMA_LOG_WARN("%s: ignoring invalid layer index %d (n_layer=%d)\n", __func__, layer_indices[i], nl);
+            }
+        }
+        LLAMA_LOG_INFO("%s: capturing %zu attn_norm outputs\n", __func__, capture_attn_norm_indices.size());
+    }
+
+    // force graph re-reserve since topology changes
+    sched_need_reserve = true;
+}
+
+const float * llama_context::get_attn_norm(int32_t layer_idx, int32_t i) {
+    auto it = attn_norm_data.find(layer_idx);
+    if (it == attn_norm_data.end()) {
+        return nullptr;
+    }
+
+    const int64_t n_embd_val = model.hparams.n_embd;
+    const int64_t offset = (int64_t)i * n_embd_val;
+
+    if (offset + n_embd_val > (int64_t)it->second.size()) {
+        LLAMA_LOG_ERROR("%s: token index %d out of range for attn_norm layer %d\n", __func__, i, layer_idx);
+        return nullptr;
+    }
+
+    return it->second.data() + offset;
+}
+
+int32_t llama_context::attn_norm_n_layers() const {
+    return (int32_t)capture_attn_norm_indices.size();
+}
+
 llama_token llama_context::get_sampled_token_ith(int32_t idx) {
     output_reorder();
 
@@ -1488,6 +1583,37 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+    }
+
+    // layer output override [obrain multi-layer geometry-of-meaning steering]
+    // — fill EACH override input tensor (if this graph has any) with the
+    // caller-supplied values for that layer. Not part of the generic
+    // res->set_inputs() dispatch since these tensors aren't registered as
+    // standard llm_graph_input.
+    for (const auto & [layer_idx, tensor] : res->t_layer_override_inp) {
+        const auto it_data = override_layer_data_by_layer.find(layer_idx);
+        if (it_data == override_layer_data_by_layer.end()) {
+            continue; // shouldn't happen (topology and data are kept in sync) but be defensive
+        }
+        ggml_backend_t backend_ov = ggml_backend_sched_get_tensor_backend(sched.get(), tensor);
+        if (backend_ov) {
+            // The override tensor matches `cur`'s FULL shape at that point in
+            // the graph, i.e. [n_embd, n_tokens, n_seqs] for a multi-token
+            // batch — NOT just [n_embd]. Fill however many elements the
+            // tensor actually has; the caller is responsible for supplying a
+            // correctly-sized buffer per layer (typically: natural captured
+            // values for every token EXCEPT the one(s) actually being
+            // perturbed, so non-perturbed positions round-trip exactly
+            // instead of reading uninitialized memory).
+            const size_t n_elements = (size_t) ggml_nelements(tensor);
+            const size_t n_bytes = n_elements * sizeof(float);
+            if (it_data->second.size() >= n_elements) {
+                ggml_backend_tensor_set(tensor, it_data->second.data(), 0, n_bytes);
+            } else {
+                LLAMA_LOG_WARN("%s: layer %d override data too small (%zu floats, need %zu)\n",
+                    __func__, layer_idx, it_data->second.size(), n_elements);
+            }
+        }
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
@@ -2092,6 +2218,30 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        // extract attn_norm outputs [obrain B1a]
+        // NOTE: accumulate across ubatches (llama_decode may split into multiple ubatches).
+        // Buffer is cleared by set_attn_norm_capture(). Within one set..encode cycle, we append.
+        if (!capture_attn_norm_indices.empty() && !res->t_attn_norm_out.empty()) {
+            const int64_t n_embd_val = hparams.n_embd;
+            for (const auto & [il, t_an] : res->t_attn_norm_out) {
+                if (!t_an) continue;
+
+                ggml_backend_t backend_an = ggml_backend_sched_get_tensor_backend(sched.get(), t_an);
+                if (!backend_an) {
+                    LLAMA_LOG_WARN("%s: no backend for attn_norm output %d\n", __func__, il);
+                    continue;
+                }
+
+                const int64_t n_tok = t_an->ne[1];
+                auto & dst = attn_norm_data[il];
+                const size_t old_size = dst.size();
+                dst.resize(old_size + n_tok * n_embd_val);
+                ggml_backend_tensor_get_async(backend_an, t_an,
+                                              dst.data() + old_size, 0,
+                                              n_tok * n_embd_val * sizeof(float));
+            }
+        }
+
         // Copy backend sampling output if this ubatch produced any sampling tensors.
         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
             const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
@@ -2457,6 +2607,8 @@ llm_graph_params llama_context::graph_params(
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.capture_layers =*/ capture_layer_indices.empty() ? nullptr : &capture_layer_indices,
+        /*.capture_attn_norm_layers =*/ capture_attn_norm_indices.empty() ? nullptr : &capture_attn_norm_indices,
+        /*.override_layers =*/ override_layer_indices.empty() ? nullptr : &override_layer_indices,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -3480,6 +3632,35 @@ int32_t llama_layer_output_n_layers(llama_context * ctx) {
     return ctx->layer_output_n_layers();
 }
 
+// layer output override [obrain multi-layer geometry-of-meaning steering] — C API wrappers
+void llama_set_layer_output_override(llama_context * ctx, int32_t layer_idx, const float * data, int32_t n_floats) {
+    ctx->set_layer_output_override(layer_idx, data, n_floats);
+}
+
+void llama_set_layer_output_override_multi(
+        llama_context        * ctx,
+        const int32_t         * layer_indices,
+        const float * const   * data,
+        const int32_t         * n_floats_per_layer,
+        int32_t                 n_overrides) {
+    ctx->set_layer_output_override_multi(layer_indices, data, n_floats_per_layer, n_overrides);
+}
+
+// post-attn-norm capture [obrain B1a] — C API wrappers
+
+void llama_set_attn_norm_capture(llama_context * ctx, const int32_t * layer_indices, int32_t n_layers) {
+    ctx->set_attn_norm_capture(layer_indices, n_layers);
+}
+
+const float * llama_get_attn_norm(llama_context * ctx, int32_t layer_idx, int32_t i) {
+    ctx->synchronize();
+    return ctx->get_attn_norm(layer_idx, i);
+}
+
+int32_t llama_attn_norm_n_layers(llama_context * ctx) {
+    return ctx->attn_norm_n_layers();
+}
+
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {
     return ctx->set_sampler(seq_id, smpl);
 }
@@ -3852,6 +4033,26 @@ void llama_perf_context_reset(llama_context * ctx) {
 // KV cache injection
 //
 
+// Helper: resolve a plain llama_kv_cache* from any memory backend type.
+// Mirrors the dispatch logic in llama_kv_cache_project_hidden so that
+// inject / inject_layer also work on hybrid (Qwen3.6, etc.) and
+// hybrid+iswa configurations. ISWA-only models still fall back to error
+// because raw K/V inject is not well-defined when both base and swa
+// caches need data simultaneously — callers should pre-resolve and call
+// per-sub-cache. Plain ISWA can be added later if needed.
+static llama_kv_cache * resolve_kv_for_inject(llama_context * ctx) {
+    auto * mem = ctx->get_memory();
+    if (!mem) return nullptr;
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
+        return kv;
+    }
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return hybrid->get_mem_attn();
+    }
+    // hybrid_iswa or plain iswa: return nullptr; caller logs an error.
+    return nullptr;
+}
+
 int32_t llama_kv_cache_inject(
         struct llama_context * ctx,
                 llama_seq_id   seq_id,
@@ -3860,9 +4061,9 @@ int32_t llama_kv_cache_inject(
           const void         * v_data,
                     int32_t    n_tokens,
                     int32_t    n_layers) {
-    auto * kv = dynamic_cast<llama_kv_cache *>(ctx->get_memory());
+    auto * kv = resolve_kv_for_inject(ctx);
     if (!kv) {
-        LLAMA_LOG_ERROR("%s: context does not use a KV cache memory backend\n", __func__);
+        LLAMA_LOG_ERROR("%s: context does not use a plain/hybrid KV cache memory backend\n", __func__);
         return -1;
     }
     return kv->inject(seq_id, pos, k_data, v_data, n_tokens, n_layers);
@@ -3876,12 +4077,28 @@ int32_t llama_kv_cache_inject_layer(
           const void         * v_data,
                     int32_t    n_tokens,
                     int32_t    layer_idx) {
-    auto * kv = dynamic_cast<llama_kv_cache *>(ctx->get_memory());
+    auto * kv = resolve_kv_for_inject(ctx);
     if (!kv) {
-        LLAMA_LOG_ERROR("%s: context does not use a KV cache memory backend\n", __func__);
+        LLAMA_LOG_ERROR("%s: context does not use a plain/hybrid KV cache memory backend\n", __func__);
         return -1;
     }
     return kv->inject_layer(seq_id, pos, k_data, v_data, n_tokens, layer_idx);
+}
+
+int32_t llama_kv_cache_extract_layer(
+        struct llama_context * ctx,
+                llama_seq_id   seq_id,
+          const llama_pos    * pos,
+                void         * k_data,
+                void         * v_data,
+                    int32_t    n_tokens,
+                    int32_t    layer_idx) {
+    auto * kv = resolve_kv_for_inject(ctx);
+    if (!kv) {
+        LLAMA_LOG_ERROR("%s: context does not use a plain/hybrid KV cache memory backend\n", __func__);
+        return -1;
+    }
+    return kv->extract_layer(seq_id, pos, k_data, v_data, n_tokens, layer_idx);
 }
 
 enum ggml_type llama_kv_cache_type_k(const struct llama_context * ctx) {

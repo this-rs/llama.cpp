@@ -29,6 +29,19 @@ llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_gr
         cur = build_norm(inpL, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
+        // post-attn-norm capture [obrain B1a]
+        if (capture_attn_norm_layers) {
+            for (const auto & cl : *capture_attn_norm_layers) {
+                if (cl == il) {
+                    ggml_tensor * copy = ggml_dup(ctx0, cur);
+                    cb(copy, "attn_norm_capture", il);
+                    res->t_attn_norm_out[il] = copy;
+                    ggml_build_forward_expand(gf, copy);
+                    break;
+                }
+            }
+        }
+
         ggml_build_forward_expand(gf, cur);
 
         // Determine layer type and build appropriate attention mechanism
@@ -75,6 +88,25 @@ llm_build_qwen35moe::llm_build_qwen35moe(const llama_model & model, const llm_gr
                     cb(copy, "l_out_capture", il);
                     res->t_layer_out[il] = copy;
                     ggml_build_forward_expand(gf, copy);
+                    break;
+                }
+            }
+        }
+
+        // layer output OVERRIDE [obrain multi-layer geometry-of-meaning
+        // steering] — substitute this layer's naturally computed output
+        // with a graph input tensor, for EVERY layer listed in
+        // override_layers (not just one — lets callers distribute a
+        // steering nudge across several layers simultaneously). See
+        // llama-graph.h for the rationale.
+        if (override_layers) {
+            for (const auto & ol : *override_layers) {
+                if (ol == il) {
+                    ggml_tensor * override_inp = ggml_dup_tensor(ctx0, cur);
+                    ggml_set_input(override_inp);
+                    cb(override_inp, "l_out_override", il);
+                    res->t_layer_override_inp[il] = override_inp;
+                    cur = override_inp;
                     break;
                 }
             }
