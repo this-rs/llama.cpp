@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include "llama-arch.h"
 #include "llama-batch.h"
 #include "llama-hparams.h"
@@ -765,6 +766,10 @@ struct llm_graph_params {
     // post-attn-norm capture [obrain B1a] — captures h_normed (input to W_Q/W_K/W_V projection)
     const std::vector<int32_t> * capture_attn_norm_layers = nullptr;
 
+    // GDN input capture [obrain HC-SPLICE-01 étape 2.5] — per-token DeltaNet transition
+    // coefficients (k, v, g, beta) for the listed recurrent layers
+    const std::vector<int32_t> * capture_gdn_layers = nullptr;
+
     // layer output OVERRIDE [obrain multi-layer geometry-of-meaning steering]
     // — if non-null, each layer index in `*override_layers` has its output
     // (the residual-stream value that becomes the next layer's input)
@@ -846,6 +851,16 @@ struct llm_graph_params {
                 return false; // one is null, the other isn't
             }
             if (*capture_layers != *other.capture_layers) {
+                return false;
+            }
+        }
+
+        // capture_gdn_layers similarly invalidates graph topology [obrain 2.5]
+        if (capture_gdn_layers != other.capture_gdn_layers) {
+            if (!capture_gdn_layers || !other.capture_gdn_layers) {
+                return false;
+            }
+            if (*capture_gdn_layers != *other.capture_gdn_layers) {
                 return false;
             }
         }
@@ -954,6 +969,10 @@ public:
 
     // post-attn-norm capture [obrain B1a] — tensor refs at attn_norm output (h_normed)
     std::map<int32_t, ggml_tensor*> t_attn_norm_out;
+
+    // GDN input capture [obrain HC-SPLICE-01 étape 2.5] — per-layer {k, v, g, beta}
+    // tensor refs at the ggml_gated_delta_net input point (set during graph build)
+    std::map<int32_t, std::array<ggml_tensor*, 4>> t_gdn_in;
 
     // layer output override [obrain multi-layer geometry-of-meaning steering]
     // — graph input tensor(s) substituted for each overridden layer's
@@ -1073,6 +1092,9 @@ struct llm_graph_context {
 
     // post-attn-norm capture [obrain B1a]
     const std::vector<int32_t> * capture_attn_norm_layers = nullptr;
+
+    // GDN input capture [obrain HC-SPLICE-01 étape 2.5]
+    const std::vector<int32_t> * capture_gdn_layers = nullptr;
 
     // layer output override [obrain multi-layer geometry-of-meaning steering]
     const std::vector<int32_t> * override_layers = nullptr;

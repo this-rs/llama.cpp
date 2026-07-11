@@ -1290,6 +1290,22 @@ extern "C" {
             const int32_t        * layer_indices,
             int32_t                n_layers);
 
+    // GDN input capture [obrain HC-SPLICE-01 étape 2.5] — capture per-token DeltaNet
+    // transition coefficients (what: 0=k, 1=v, 2=g/gate, 3=beta) for the listed
+    // recurrent layers. Buffers accumulate across ubatches within one decode cycle
+    // and are cleared by calling llama_set_gdn_input_capture again.
+    LLAMA_API void llama_set_gdn_input_capture(
+                     struct llama_context * ctx,
+                     const int32_t * layer_indices,
+                     int32_t n_layers);
+
+    // dims_out[3] = {ne0, ne1 (= heads), n_tokens_total}; returns NULL if absent.
+    LLAMA_API const float * llama_get_gdn_captured(
+                     struct llama_context * ctx,
+                     int32_t layer_idx,
+                     int32_t what,
+                     int64_t * dims_out);
+
     // Get captured attn_norm output for a layer & token index. Returns n_embd floats or NULL.
     LLAMA_API const float * llama_get_attn_norm(
             struct llama_context * ctx,

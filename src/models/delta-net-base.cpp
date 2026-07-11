@@ -432,6 +432,30 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
         int           il) {
     const int64_t n_seq_tokens = q->ne[2];
 
+    // GDN input capture [obrain HC-SPLICE-01 étape 2.5] — contiguous copies of the
+    // per-token transition coefficients BEFORE the recurrence, so the affine maps
+    // S ← α_t (I − β_t k_t k_tᵀ) S + β_t k_t v_tᵀ can be replayed offline.
+    if (capture_gdn_layers) {
+        for (const auto & cl : *capture_gdn_layers) {
+            if (cl == il) {
+                ggml_tensor * ck  = ggml_dup(ctx0, k);
+                ggml_tensor * cv  = ggml_dup(ctx0, v);
+                ggml_tensor * cg  = ggml_dup(ctx0, g);
+                ggml_tensor * cbt = ggml_dup(ctx0, b);
+                cb(ck,  "gdn_k_capture", il);
+                cb(cv,  "gdn_v_capture", il);
+                cb(cg,  "gdn_g_capture", il);
+                cb(cbt, "gdn_b_capture", il);
+                res->t_gdn_in[il] = { ck, cv, cg, cbt };
+                ggml_build_forward_expand(gf, ck);
+                ggml_build_forward_expand(gf, cv);
+                ggml_build_forward_expand(gf, cg);
+                ggml_build_forward_expand(gf, cbt);
+                break;
+            }
+        }
+    }
+
     if (n_seq_tokens == 1) {
         if (cparams.fused_gdn_ar) {
             return build_delta_net_fused(q, k, v, g, b, s, il);

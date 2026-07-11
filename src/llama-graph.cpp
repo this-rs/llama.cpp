@@ -1441,6 +1441,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers                  (params.samplers),
     capture_layers            (params.capture_layers),
     capture_attn_norm_layers  (params.capture_attn_norm_layers),
+    capture_gdn_layers        (params.capture_gdn_layers),
     override_layers            (params.override_layers),
     cb_func                   (params.cb),
     res              (params.res),

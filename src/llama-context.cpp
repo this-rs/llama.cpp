@@ -989,6 +989,48 @@ int32_t llama_context::layer_output_n_layers() const {
     return (int32_t)capture_layer_indices.size();
 }
 
+// GDN input capture [obrain HC-SPLICE-01 étape 2.5]
+
+void llama_context::set_gdn_input_capture(const int32_t * layer_indices, int32_t n_layers) {
+    capture_gdn_indices.clear();
+    gdn_data.clear();
+    gdn_dims.clear();
+
+    if (layer_indices && n_layers > 0) {
+        const int32_t nl = (int32_t)model.hparams.n_layer();
+        for (int32_t i = 0; i < n_layers; ++i) {
+            if (layer_indices[i] >= 0 && layer_indices[i] < nl) {
+                capture_gdn_indices.push_back(layer_indices[i]);
+            } else {
+                LLAMA_LOG_WARN("%s: ignoring invalid layer index %d (n_layer=%d)\n", __func__, layer_indices[i], nl);
+            }
+        }
+        LLAMA_LOG_INFO("%s: capturing GDN inputs for %zu layers\n", __func__, capture_gdn_indices.size());
+    }
+
+    // force graph re-reserve since topology changes
+    sched_need_reserve = true;
+}
+
+const float * llama_context::get_gdn_captured(int32_t layer_idx, int32_t what, int64_t * dims_out) const {
+    if (what < 0 || what > 3) {
+        return nullptr;
+    }
+    auto it = gdn_data.find(layer_idx);
+    if (it == gdn_data.end() || it->second[what].empty()) {
+        return nullptr;
+    }
+    if (dims_out) {
+        auto itd = gdn_dims.find(layer_idx);
+        if (itd != gdn_dims.end()) {
+            dims_out[0] = itd->second[what][0];
+            dims_out[1] = itd->second[what][1];
+            dims_out[2] = itd->second[what][2];
+        }
+    }
+    return it->second[what].data();
+}
+
 // layer output override [obrain multi-layer geometry-of-meaning steering]
 
 void llama_context::set_layer_output_override(int32_t layer_idx, const float * data, int32_t n_floats) {
@@ -2377,6 +2419,32 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        // extract GDN inputs [obrain HC-SPLICE-01 étape 2.5]
+        // NOTE: accumulate across ubatches (same pattern as attn_norm capture).
+        // Buffer is cleared by set_gdn_input_capture().
+        if (!capture_gdn_indices.empty() && !res->t_gdn_in.empty()) {
+            for (const auto & [il, tensors] : res->t_gdn_in) {
+                for (int w = 0; w < 4; ++w) {
+                    ggml_tensor * t = tensors[w];
+                    if (!t) continue;
+                    ggml_backend_t bk = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+                    if (!bk) {
+                        LLAMA_LOG_WARN("%s: no backend for GDN capture l=%d w=%d\n", __func__, il, w);
+                        continue;
+                    }
+                    const int64_t nel = ggml_nelements(t);
+                    auto & dst = gdn_data[il][w];
+                    const size_t old_size = dst.size();
+                    dst.resize(old_size + nel);
+                    ggml_backend_tensor_get_async(bk, t, dst.data() + old_size, 0, nel * sizeof(float));
+                    auto & dd = gdn_dims[il][w];
+                    dd[0] = t->ne[0];
+                    dd[1] = t->ne[1];
+                    dd[2] += t->ne[2]; // accumulate token count across ubatches
+                }
+            }
+        }
+
         extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
 
         // extract nextn embeddings before
@@ -2844,6 +2912,7 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.capture_layers =*/ capture_layer_indices.empty() ? nullptr : &capture_layer_indices,
         /*.capture_attn_norm_layers =*/ capture_attn_norm_indices.empty() ? nullptr : &capture_attn_norm_indices,
+        /*.capture_gdn_layers =*/ capture_gdn_indices.empty() ? nullptr : &capture_gdn_indices,
         /*.override_layers =*/ override_layer_indices.empty() ? nullptr : &override_layer_indices,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -4182,6 +4251,16 @@ void llama_set_layer_output_override_multi(
 
 void llama_set_attn_norm_capture(llama_context * ctx, const int32_t * layer_indices, int32_t n_layers) {
     ctx->set_attn_norm_capture(layer_indices, n_layers);
+}
+
+// GDN input capture [obrain HC-SPLICE-01 étape 2.5]
+
+void llama_set_gdn_input_capture(llama_context * ctx, const int32_t * layer_indices, int32_t n_layers) {
+    ctx->set_gdn_input_capture(layer_indices, n_layers);
+}
+
+const float * llama_get_gdn_captured(llama_context * ctx, int32_t layer_idx, int32_t what, int64_t * dims_out) {
+    return ctx->get_gdn_captured(layer_idx, what, dims_out);
 }
 
 const float * llama_get_attn_norm(llama_context * ctx, int32_t layer_idx, int32_t i) {

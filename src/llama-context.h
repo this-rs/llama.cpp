@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include "llama.h"
 #include "llama-ext.h"
 #include "llama-cparams.h"
@@ -184,6 +185,11 @@ struct llama_context {
 
     // post-attn-norm capture [obrain B1a] — captures h_normed (input to W_Q/W_K/W_V)
     void set_attn_norm_capture(const int32_t * layer_indices, int32_t n_layers);
+
+    // GDN input capture [obrain HC-SPLICE-01 étape 2.5]
+    void set_gdn_input_capture(const int32_t * layer_indices, int32_t n_layers);
+    // what: 0=k, 1=v, 2=g, 3=beta ; dims_out[3] = {ne0, ne1(=heads), n_tokens_total}
+    const float * get_gdn_captured(int32_t layer_idx, int32_t what, int64_t * dims_out) const;
     const float * get_attn_norm(int32_t layer_idx, int32_t i);
     int32_t attn_norm_n_layers() const;
 
@@ -462,6 +468,11 @@ private:
     // post-attn-norm capture [obrain B1a]
     std::vector<int32_t> capture_attn_norm_indices;                // which layers to capture h_normed
     std::map<int32_t, std::vector<float>> attn_norm_data;          // [layer_idx] → [n_tokens * n_embd]
+
+    // GDN input capture [obrain HC-SPLICE-01 étape 2.5]
+    std::vector<int32_t> capture_gdn_indices;                       // which recurrent layers
+    std::map<int32_t, std::array<std::vector<float>, 4>> gdn_data;  // [il] → {k, v, g, beta}, accumulated across ubatches
+    std::map<int32_t, std::array<std::array<int64_t, 3>, 4>> gdn_dims; // [il][what] → {ne0, ne1, n_tokens_total}
 
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;
