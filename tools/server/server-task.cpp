@@ -1970,6 +1970,25 @@ json server_task_result_set_attn_mask::to_json() {
     return json {{ "success", true }};
 }
 
+json server_task_result_jspace_compare::to_json() {
+    return json {
+        { "text_baseline",    text_baseline },
+        { "text_eigen",       text_eigen },
+        { "text_random",      text_random },
+        { "h_rms",            h_rms },
+        { "top_eigenvalue",   top_eigenvalue },
+        { "gram_seconds",     gram_seconds },
+    };
+}
+
+json server_task_result_jspace_inject::to_json() {
+    return json {
+        { "text",        text },
+        { "fact_tokens", fact_tokens },
+        { "blob_bytes",  blob_bytes },
+    };
+}
+
 //
 // server_prompt_cache
 //

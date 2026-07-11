@@ -8,7 +8,9 @@
 
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <set>
+#include <string>
 
 struct server_context_impl; // private implementation
 
@@ -123,6 +125,13 @@ struct server_routes {
     server_http_context::handler_t get_lora_adapters;
     server_http_context::handler_t post_lora_adapters;
     server_http_context::handler_t post_attn_mask;
+    // J-space geometric analysis [obrain] — see server-context.cpp for the
+    // rationale; both are model-weight-only reads (thread-safe, no task
+    // queue needed, same class of endpoint as get_props/post_props).
+    server_http_context::handler_t get_jspace_gram;
+    server_http_context::handler_t post_jspace_readout_forward;
+    server_http_context::handler_t post_jspace_compare_generation;
+    server_http_context::handler_t post_jspace_inject_knowledge;
 private:
     std::unique_ptr<server_res_generator> handle_completions_impl(
             const server_http_req & req,
@@ -137,6 +146,15 @@ private:
 
     // using unique_ptr to allow late initialization of const
     std::unique_ptr<const server_context_meta> meta;
+
+    // J-space [obrain] — the readout Gram matrix (W_out^T @ W_out) is a
+    // MODEL CONSTANT (independent of any activation/request) but expensive
+    // to compute (streams over the full vocabulary — measured at ~700-900s
+    // on real production-scale models). Compute it ONCE, lazily, on first
+    // request, cache the base64-encoded result for all subsequent requests.
+    mutable std::mutex jspace_mutex;
+    mutable std::string jspace_gram_b64_cache;
+    mutable bool jspace_gram_cached = false;
 
     const common_params & params;
     const server_context_impl & ctx_server;

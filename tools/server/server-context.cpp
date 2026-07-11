@@ -6,6 +6,7 @@
 #include "server-task.h"
 #include "server-queue.h"
 
+#include "base64.hpp" // [obrain] J-space endpoints — encode float buffers compactly
 #include "build-info.h"
 #include "common.h"
 #include "llama.h"
@@ -35,6 +36,116 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// J-space geometric analysis helpers [obrain] — PO plan 4749fb72.
+// C++ port of the same math already validated in llm-engine's jspace.rs /
+// codazzi.rs (see PO notes 5f511bbe, 49299642). Kept deliberately close to
+// the Rust originals (same derivation, same rank-2-update trick) rather than
+// re-deriving from scratch, to minimize the risk of a subtle divergence.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// RMSNorm scale s(x) = sqrt(mean(x^2) + eps).
+static float jspace_rms_scale(const std::vector<float> & x, float eps) {
+    double sum_sq = 0.0;
+    for (float v : x) sum_sq += (double) v * v;
+    return (float) std::sqrt(sum_sq / x.size() + (double) eps);
+}
+
+// gamma_gram_{ij} = gamma_i * gamma_j * gram_{ij} — model constant, computed
+// once per (model, gamma, gram) triple.
+static std::vector<float> jspace_precompute_gamma_gram(const std::vector<float> & gram, const std::vector<float> & gamma) {
+    const int n = (int) gamma.size();
+    std::vector<float> out((size_t) n * n);
+    for (int i = 0; i < n; i++) {
+        const float gi = gamma[i];
+        for (int j = 0; j < n; j++) {
+            out[(size_t) i * n + j] = gi * gamma[j] * gram[(size_t) i * n + j];
+        }
+    }
+    return out;
+}
+
+// g_out(x) = P^T @ (gamma_gram / s^2) @ P via the rank-2-update trick — see
+// jspace.rs module docs for the full derivation. O(n^2), not O(n^3).
+static std::vector<float> jspace_g_out(const std::vector<float> & x, const std::vector<float> & gamma_gram, float eps) {
+    const int n = (int) x.size();
+    const float s = jspace_rms_scale(x, eps);
+    const float inv_s2 = 1.0f / (s * s);
+    const float c = 1.0f / ((float) n * s * s);
+
+    std::vector<float> u(n);
+    for (int i = 0; i < n; i++) {
+        const float * row = &gamma_gram[(size_t) i * n];
+        float acc = 0.0f;
+        for (int j = 0; j < n; j++) acc += row[j] * x[j];
+        u[i] = acc * inv_s2;
+    }
+    float a = 0.0f;
+    for (int i = 0; i < n; i++) a += x[i] * u[i];
+
+    std::vector<float> g((size_t) n * n);
+    for (int i = 0; i < n; i++) {
+        const float * gram_row = &gamma_gram[(size_t) i * n];
+        float * g_row = &g[(size_t) i * n];
+        const float xi = x[i], ui = u[i];
+        for (int j = 0; j < n; j++) {
+            const float m_ij = gram_row[j] * inv_s2;
+            g_row[j] = m_ij - c * (xi * u[j] + ui * x[j]) + c * c * a * xi * x[j];
+        }
+    }
+    return g;
+}
+
+// Top eigenvalue/eigenvector of a symmetric PSD matrix via power iteration —
+// O(n^2) per iteration, no dense linalg dependency needed.
+static std::pair<float, std::vector<float>> jspace_top_eigenpair_psd(const std::vector<float> & mat, int n, int n_iters, uint32_t seed) {
+    std::vector<float> v(n);
+    for (int i = 0; i < n; i++) {
+        uint32_t h = (uint32_t) i * 2654435761u + seed * 999983u + 7u;
+        v[i] = (float) (h % 1000) / 500.0f - 1.0f;
+    }
+    float norm = 0.0f;
+    for (float x : v) norm += x * x;
+    norm = std::sqrt(norm);
+    if (norm < 1e-12f) norm = 1e-12f;
+    for (float & x : v) x /= norm;
+
+    float lambda = 0.0f;
+    std::vector<float> w(n);
+    for (int it = 0; it < n_iters; it++) {
+        for (int i = 0; i < n; i++) {
+            const float * row = &mat[(size_t) i * n];
+            float acc = 0.0f;
+            for (int j = 0; j < n; j++) acc += row[j] * v[j];
+            w[i] = acc;
+        }
+        float wn = 0.0f;
+        for (float x : w) wn += x * x;
+        wn = std::sqrt(wn);
+        if (wn < 1e-20f) break;
+        for (int i = 0; i < n; i++) v[i] = w[i] / wn;
+        lambda = wn;
+    }
+    return { lambda, v };
+}
+
+// Deterministic pseudo-random unit direction (not necessarily orthogonal to
+// anything in particular — used as a generic "random direction" baseline
+// for comparison against the eigenvector direction).
+static std::vector<float> jspace_random_direction(int n, uint32_t seed) {
+    std::vector<float> v(n);
+    for (int i = 0; i < n; i++) {
+        uint32_t h = (uint32_t) i * 2654435761u + seed * 83492791u + 13u;
+        v[i] = (float) (h % 1000) / 500.0f - 1.0f;
+    }
+    float norm = 0.0f;
+    for (float x : v) norm += x * x;
+    norm = std::sqrt(norm);
+    if (norm < 1e-12f) norm = 1e-12f;
+    for (float & x : v) x /= norm;
+    return v;
+}
 
 static server_prompt_checkpoint server_get_checkpoint(llama_context * ctx, int id, int64_t n_tokens, llama_pos pos_min = -1, llama_pos pos_max = -1) {
     if (pos_min == -1) {
@@ -667,6 +778,14 @@ private:
 
     llama_context * ctx = nullptr;
 
+    // J-space [obrain] — Gram matrix cache for SERVER_TASK_TYPE_JSPACE_COMPARE_GENERATION,
+    // lazily computed once (~150-300s) and reused across all such tasks
+    // processed by this worker. Separate from server_routes::jspace_gram_b64_cache
+    // (the /jspace/gram HTTP handler's own cache) since this one lives on
+    // the worker-thread side and is consumed as raw floats, not base64 JSON.
+    std::vector<float> jspace_gram_cache;
+    bool                jspace_gram_ready = false;
+
     llama_batch batch {};
 
     llama_model_ptr model_dft;
@@ -1074,16 +1193,36 @@ private:
         return nullptr;
     }
 
+    // J-space [obrain] — the LAST slot is reserved exclusively for
+    // llama_set_layer_output_override-based debug/research tasks
+    // (SERVER_TASK_TYPE_JSPACE_COMPARE_GENERATION) when the server is
+    // provisioned with >= 3 parallel slots (`--parallel 3` or more).
+    // Normal completion routing NEVER selects this slot (see the
+    // `slot.id == jspace_reserved_slot_id()` skip below in both
+    // get_available_slot() loops) — this is what makes it safe for the
+    // J-space task to call llama_decode/llama_set_layer_output_override
+    // directly on `ctx` with this slot's seq_id, without any risk of
+    // racing with concurrent production traffic on the other slots.
+    // Returns -1 (no reservation, no slot excluded) if n_parallel < 3, so
+    // deployments that haven't opted in keep their full normal capacity.
+    int32_t jspace_reserved_slot_id() const {
+        return params_base.n_parallel >= 3 ? (int32_t) params_base.n_parallel - 1 : -1;
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
         bool update_cache = false;
+        const int32_t reserved_id = jspace_reserved_slot_id();
 
         // find the slot that has at least n% prompt similarity
         if (ret == nullptr && slot_prompt_similarity != 0.0f) {
             float sim_best = 0;
 
             for (server_slot & slot : slots) {
+                if (slot.id == reserved_id) {
+                    continue;
+                }
                 // skip the slot if it is not available
                 if (slot.is_processing()) {
                     continue;
@@ -1125,6 +1264,9 @@ private:
             int64_t t_last = -1;
 
             for (server_slot & slot : slots) {
+                if (slot.id == reserved_id) {
+                    continue;
+                }
                 // skip the slot if it is not available
                 if (slot.is_processing()) {
                     continue;
@@ -2130,6 +2272,323 @@ private:
                     }
                     auto res = std::make_unique<server_task_result_set_attn_mask>();
                     res->id = task.id;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_JSPACE_COMPARE_GENERATION:
+                {
+                    // [obrain] PO plan 4749fb72 — see jspace_reserved_slot_id()
+                    // above for why this is safe to run directly on `ctx`
+                    // without going through the normal slot/batching system:
+                    // this seq_id is NEVER assigned to normal completions.
+                    const int32_t seq_id = jspace_reserved_slot_id();
+                    if (seq_id < 0) {
+                        auto res = std::make_unique<server_task_result_error>();
+                        res->id = task.id;
+                        res->err_type = ERROR_TYPE_NOT_SUPPORTED;
+                        res->err_msg = "J-space live-testing requires the server to be started with "
+                                       "--parallel 3 (or more) to reserve a dedicated slot; current "
+                                       "--parallel is too low.";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    const int32_t n_embd  = llama_model_n_embd(model);
+                    const int32_t n_layer = llama_model_n_layer(model);
+                    const int32_t last_layer = n_layer - 1;
+
+                    // Gram matrix — model constant, computed once, cached.
+                    if (!jspace_gram_ready) {
+                        SRV_INF("%s", "[jspace] computing readout gram matrix (one-time, ~150-300s)...\n");
+                        jspace_gram_cache.assign((size_t) n_embd * n_embd, 0.0f);
+                        const int32_t rc = llama_model_get_output_gram_matrix(model, jspace_gram_cache.data());
+                        if (rc != n_embd) {
+                            auto res = std::make_unique<server_task_result_error>();
+                            res->id = task.id;
+                            res->err_type = ERROR_TYPE_SERVER;
+                            res->err_msg = "failed to compute readout gram matrix";
+                            queue_results.send(std::move(res));
+                            break;
+                        }
+                        jspace_gram_ready = true;
+                        SRV_INF("%s", "[jspace] gram matrix ready\n");
+                    }
+
+                    std::vector<float> gamma((size_t) n_embd);
+                    llama_model_get_output_norm_weight(model, gamma.data());
+                    std::vector<float> gamma_gram = jspace_precompute_gamma_gram(jspace_gram_cache, gamma);
+
+                    // Tokenize the prompt.
+                    std::vector<llama_token> tokens = common_tokenize(ctx, task.jspace_prompt, true, true);
+                    if (tokens.size() < 2) {
+                        auto res = std::make_unique<server_task_result_error>();
+                        res->id = task.id;
+                        res->err_type = ERROR_TYPE_INVALID_REQUEST;
+                        res->err_msg = "prompt must tokenize to at least 2 tokens";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+                    const int32_t n_tok = (int32_t) tokens.size();
+
+                    auto decode_batch = [&](const std::vector<llama_token> & toks, int32_t pos_start, bool want_logits) -> int {
+                        llama_batch b = llama_batch_init((int32_t) toks.size(), 0, 1);
+                        for (int32_t i = 0; i < (int32_t) toks.size(); i++) {
+                            b.token[i]     = toks[i];
+                            b.pos[i]       = pos_start + i;
+                            b.n_seq_id[i]  = 1;
+                            b.seq_id[i][0] = seq_id;
+                            b.logits[i]    = want_logits && (i == (int32_t) toks.size() - 1);
+                        }
+                        b.n_tokens = (int32_t) toks.size();
+                        const int rc = llama_decode(ctx, b);
+                        llama_batch_free(b);
+                        return rc;
+                    };
+
+                    // Natural decode: prefix, then last token WITH capture,
+                    // to get the real h at the last layer.
+                    llama_memory_seq_rm(llama_get_memory(ctx), seq_id, -1, -1);
+                    const std::vector<llama_token> prefix(tokens.begin(), tokens.end() - 1);
+                    if (!prefix.empty()) {
+                        decode_batch(prefix, 0, false);
+                    }
+                    llama_set_layer_output_override(ctx, -1, nullptr, 0); // ensure clean state
+                    const int32_t capture_layer = last_layer;
+                    llama_set_layer_output_capture(ctx, &capture_layer, 1);
+                    decode_batch({ tokens.back() }, n_tok - 1, true);
+                    const float * h_ptr = llama_get_layer_output(ctx, last_layer, 0);
+                    std::vector<float> h;
+                    if (h_ptr) {
+                        h.assign(h_ptr, h_ptr + n_embd);
+                    }
+                    llama_set_layer_output_capture(ctx, nullptr, 0);
+
+                    if (h.empty()) {
+                        auto res = std::make_unique<server_task_result_error>();
+                        res->id = task.id;
+                        res->err_type = ERROR_TYPE_SERVER;
+                        res->err_msg = "failed to capture layer output for h";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    std::vector<float> g = jspace_g_out(h, gamma_gram, 1e-6f);
+                    auto [top_eigenvalue, top_eigenvector] = jspace_top_eigenpair_psd(g, n_embd, 100, 42);
+                    std::vector<float> random_dir = jspace_random_direction(n_embd, 777);
+
+                    const float h_rms = jspace_rms_scale(h, 0.0f);
+                    const float scale = task.jspace_scale * h_rms;
+
+                    auto make_delta = [&](const std::vector<float> & dir) {
+                        std::vector<float> delta(n_embd);
+                        for (int32_t i = 0; i < n_embd; i++) delta[i] = dir[i] * scale;
+                        return delta;
+                    };
+                    std::vector<float> delta_eigen  = make_delta(top_eigenvector);
+                    std::vector<float> delta_random = make_delta(random_dir);
+
+                    // Run one generation branch: decode prefix, decode last
+                    // token (optionally overridden), then continue normally
+                    // (override cleared) for n_generate tokens.
+                    auto run_branch = [&](const float * delta) -> std::string {
+                        llama_memory_seq_rm(llama_get_memory(ctx), seq_id, -1, -1);
+                        if (!prefix.empty()) {
+                            decode_batch(prefix, 0, false);
+                        }
+                        if (delta) {
+                            std::vector<float> h_pert(n_embd);
+                            for (int32_t i = 0; i < n_embd; i++) h_pert[i] = h[i] + delta[i];
+                            llama_set_layer_output_override(ctx, last_layer, h_pert.data(), n_embd);
+                        }
+                        decode_batch({ tokens.back() }, n_tok - 1, true);
+                        if (delta) {
+                            llama_set_layer_output_override(ctx, -1, nullptr, 0);
+                        }
+
+                        // Greedy decoding only changes output when the
+                        // ARGMAX token itself flips — too high a bar to
+                        // reveal small-but-real distributional shifts
+                        // (discovered live: identical text across all 3
+                        // branches with greedy at scale=0.15). Matches the
+                        // stochastic temp+dist sampler already validated in
+                        // llm-engine's Rust experiment (PO note, real
+                        // generation comparison) — fixed seed per branch
+                        // for reproducibility.
+                        llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+                        llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.7f));
+                        llama_sampler_chain_add(smpl, llama_sampler_init_dist(42));
+                        std::string text;
+                        int32_t cur_pos = n_tok;
+                        const llama_token eos = llama_vocab_eos(vocab);
+                        for (int32_t t = 0; t < task.jspace_n_generate; t++) {
+                            const llama_token tok = llama_sampler_sample(smpl, ctx, -1);
+                            if (tok == eos) break;
+                            text += common_token_to_piece(vocab, tok);
+                            llama_sampler_accept(smpl, tok);
+                            if (decode_batch({ tok }, cur_pos, true) != 0) break;
+                            cur_pos++;
+                        }
+                        llama_sampler_free(smpl);
+                        return text;
+                    };
+
+                    auto res = std::make_unique<server_task_result_jspace_compare>();
+                    res->id             = task.id;
+                    res->h_rms          = h_rms;
+                    res->top_eigenvalue = top_eigenvalue;
+                    res->text_baseline  = run_branch(nullptr);
+                    res->text_eigen     = run_branch(delta_eigen.data());
+                    res->text_random    = run_branch(delta_random.data());
+
+                    llama_memory_seq_rm(llama_get_memory(ctx), seq_id, -1, -1);
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_JSPACE_INJECT_KNOWLEDGE:
+                {
+                    // [obrain] PO plan 4749fb72, tâche P5-T5 — production
+                    // entry point for the KV-splice mechanism validated
+                    // end-to-end in llm-engine this session (notes
+                    // 4392e92f/6abdcc46/2b554afe). Runs on the same
+                    // reserved seq_id as JSPACE_COMPARE_GENERATION — never
+                    // touched by normal completion traffic.
+                    //
+                    // Deliberate scope limits, established empirically and
+                    // enforced by design here (see note 4392e92f):
+                    //  - ONE fact per call. Concatenating multiple facts on
+                    //    the same scratch sequence before extraction was
+                    //    tested and causes real interference (drift to an
+                    //    unrelated third theme, then incoherence) — no
+                    //    multi-fact support here, by design.
+                    //  - No attempt to override a well-established/contested
+                    //    fact already known to the model — four distinct
+                    //    continuous/reactive re-injection designs were
+                    //    tried and all fail differently (repetition loops,
+                    //    reasoning-restart loops). This endpoint is for
+                    //    NOVEL/complementary knowledge only.
+                    const int32_t seq_id = jspace_reserved_slot_id();
+                    if (seq_id < 0) {
+                        auto res = std::make_unique<server_task_result_error>();
+                        res->id = task.id;
+                        res->err_type = ERROR_TYPE_NOT_SUPPORTED;
+                        res->err_msg = "J-space live-testing requires the server to be started with "
+                                       "--parallel 3 (or more) to reserve a dedicated slot; current "
+                                       "--parallel is too low.";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    std::vector<llama_token> fact_tokens  = common_tokenize(ctx, task.jspace_fact_text, true, true);
+                    std::vector<llama_token> query_tokens = common_tokenize(ctx, task.jspace_prompt, false, true);
+                    if (fact_tokens.empty() || query_tokens.empty()) {
+                        auto res = std::make_unique<server_task_result_error>();
+                        res->id = task.id;
+                        res->err_type = ERROR_TYPE_INVALID_REQUEST;
+                        res->err_msg = "'fact_text' and 'prompt' must both tokenize to at least 1 token";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+                    const int32_t n_fact  = (int32_t) fact_tokens.size();
+                    const int32_t n_query = (int32_t) query_tokens.size();
+
+                    auto decode_batch = [&](const std::vector<llama_token> & toks, int32_t pos_start, bool want_logits) -> int {
+                        llama_batch b = llama_batch_init((int32_t) toks.size(), 0, 1);
+                        for (int32_t i = 0; i < (int32_t) toks.size(); i++) {
+                            b.token[i]     = toks[i];
+                            b.pos[i]       = pos_start + i;
+                            b.n_seq_id[i]  = 1;
+                            b.seq_id[i][0] = seq_id;
+                            b.logits[i]    = want_logits && (i == (int32_t) toks.size() - 1);
+                        }
+                        b.n_tokens = (int32_t) toks.size();
+                        const int rc = llama_decode(ctx, b);
+                        llama_batch_free(b);
+                        return rc;
+                    };
+
+                    // (A) Process the fact for real on the reserved seq —
+                    // its tokens are NEVER part of the query's batch.
+                    llama_memory_seq_rm(llama_get_memory(ctx), seq_id, -1, -1);
+                    if (decode_batch(fact_tokens, 0, false) != 0) {
+                        auto res = std::make_unique<server_task_result_error>();
+                        res->id = task.id;
+                        res->err_type = ERROR_TYPE_SERVER;
+                        res->err_msg = "failed to decode fact_text";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    // (B) Extract the FULL state (attention + recurrent —
+                    // the recurrent component is what carries the fusion
+                    // effect, note 4392e92f; attention-only was tested and
+                    // does not reproduce it, note P5-T3).
+                    const size_t blob_size = llama_state_seq_get_size(ctx, seq_id);
+                    std::vector<uint8_t> blob(blob_size);
+                    const size_t written = llama_state_seq_get_data(ctx, blob.data(), blob_size, seq_id);
+                    if (written == 0) {
+                        auto res = std::make_unique<server_task_result_error>();
+                        res->id = task.id;
+                        res->err_type = ERROR_TYPE_SERVER;
+                        res->err_msg = "failed to extract fact state";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+                    blob.resize(written);
+
+                    // (C) Round-trip: clear + reinject. Mechanically a
+                    // no-op for THIS single call (the values are
+                    // byte-identical), but it exercises the real
+                    // extract/inject path end-to-end and is the seam a
+                    // future cross-request blob cache would split at
+                    // (extract once, inject+generate many times against
+                    // different query prompts without re-paying the
+                    // fact's decode cost) — not implemented here, single
+                    // fused call only for this first production version.
+                    llama_memory_seq_rm(llama_get_memory(ctx), seq_id, -1, -1);
+                    if (llama_state_seq_set_data(ctx, blob.data(), blob.size(), seq_id) == 0) {
+                        auto res = std::make_unique<server_task_result_error>();
+                        res->id = task.id;
+                        res->err_type = ERROR_TYPE_SERVER;
+                        res->err_msg = "failed to inject fact state";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    // (D) Decode the query prompt AFTER the spliced fact.
+                    if (decode_batch(query_tokens, n_fact, true) != 0) {
+                        auto res = std::make_unique<server_task_result_error>();
+                        res->id = task.id;
+                        res->err_type = ERROR_TYPE_SERVER;
+                        res->err_msg = "failed to decode query prompt";
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    // (E) Generate — same stochastic sampler (fixed seed)
+                    // as JSPACE_COMPARE_GENERATION, for the same reason
+                    // (greedy only reveals argmax flips).
+                    llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+                    llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.7f));
+                    llama_sampler_chain_add(smpl, llama_sampler_init_dist(42));
+                    std::string text;
+                    int32_t cur_pos = n_fact + n_query;
+                    const llama_token eos = llama_vocab_eos(vocab);
+                    const int32_t n_generate = task.jspace_n_generate > 0 ? task.jspace_n_generate : 24;
+                    for (int32_t t = 0; t < n_generate; t++) {
+                        const llama_token tok = llama_sampler_sample(smpl, ctx, -1);
+                        if (tok == eos) break;
+                        text += common_token_to_piece(vocab, tok);
+                        llama_sampler_accept(smpl, tok);
+                        if (decode_batch({ tok }, cur_pos, true) != 0) break;
+                        cur_pos++;
+                    }
+                    llama_sampler_free(smpl);
+
+                    llama_memory_seq_rm(llama_get_memory(ctx), seq_id, -1, -1);
+
+                    auto res = std::make_unique<server_task_result_jspace_inject>();
+                    res->id          = task.id;
+                    res->text        = text;
+                    res->fact_tokens = n_fact;
+                    res->blob_bytes  = blob.size();
                     queue_results.send(std::move(res));
                 } break;
         }
@@ -4215,6 +4674,210 @@ void server_routes::init_routes() {
         }
 
         GGML_ASSERT(dynamic_cast<server_task_result_set_attn_mask*>(result.get()) != nullptr);
+        res->ok(result->to_json());
+        return res;
+    };
+
+    // GET /jspace/gram — readout Gram matrix (W_out^T @ W_out), base64-encoded
+    // f32 LE, row-major n_embd x n_embd. Model constant — computed once,
+    // lazily, on first request, cached for the server process lifetime. See
+    // PO plan 4749fb72 (project cognitive-canvas): this is the expensive
+    // constant term of the g^out(h) = J^T @ gram @ J pullback metric — meant
+    // to be fetched ONCE by a client and reused locally for many cheap
+    // per-activation g^out(h) evaluations (never recomputed server-side per
+    // request). Model-weight-only read — thread-safe, no task queue needed
+    // (same class of endpoint as get_props/post_props above).
+    this->get_jspace_gram = [this](const server_http_req &) {
+        auto res = create_response(true);
+
+        if (!ctx_server.model) {
+            res->error(format_error_response("model not loaded (server may be sleeping)", ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
+
+        const int32_t n_embd = llama_model_n_embd(ctx_server.model);
+
+        std::lock_guard<std::mutex> lock(jspace_mutex);
+        if (!jspace_gram_cached) {
+            std::vector<float> gram((size_t) n_embd * n_embd);
+            SRV_INF("%s", "[jspace] computing readout Gram matrix (one-time, can take minutes)...\n");
+            const int32_t rc = llama_model_get_output_gram_matrix(ctx_server.model, gram.data());
+            if (rc != n_embd) {
+                res->error(format_error_response("failed to compute Gram matrix", ERROR_TYPE_SERVER));
+                return res;
+            }
+            jspace_gram_b64_cache = base64::encode(
+                reinterpret_cast<const char *>(gram.data()), gram.size() * sizeof(float));
+            jspace_gram_cached = true;
+            SRV_INF("%s", "[jspace] Gram matrix computed and cached\n");
+        }
+
+        json out = {
+            { "n_embd",      n_embd },
+            { "dtype",       "f32" },
+            { "layout",      "row_major" },
+            { "gram_base64", jspace_gram_b64_cache },
+        };
+        res->ok(out);
+        return res;
+    };
+
+    // POST /jspace/readout_forward — real logits for an arbitrary
+    // pre-output_norm hidden state h (RMSNorm + matmul with output.weight).
+    // Ground truth for validating the g^out(h) pullback prediction against
+    // real KL divergence — see H4 in PO plans 5675adc9 / 0648bb5e
+    // (cognitive-canvas project). Cheap (O(n_vocab*n_embd), not
+    // O(n_vocab*n_embd^2) like the Gram matrix above) — safe to call once
+    // per request. Body: { "h": [float, ...] } (length must equal n_embd).
+    this->post_jspace_readout_forward = [this](const server_http_req & req) {
+        auto res = create_response(true);
+
+        if (!ctx_server.model) {
+            res->error(format_error_response("model not loaded (server may be sleeping)", ERROR_TYPE_UNAVAILABLE));
+            return res;
+        }
+
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const std::exception & e) {
+            res->error(format_error_response(std::string("invalid JSON body: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!body.contains("h") || !body["h"].is_array()) {
+            res->error(format_error_response("'h' must be an array of floats", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        const int32_t n_embd = llama_model_n_embd(ctx_server.model);
+        const auto & j_h = body["h"];
+        if ((int32_t) j_h.size() != n_embd) {
+            res->error(format_error_response(
+                "'h' length must be " + std::to_string(n_embd) + ", got " + std::to_string(j_h.size()),
+                ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        std::vector<float> h(n_embd);
+        for (int32_t i = 0; i < n_embd; ++i) {
+            h[i] = j_h[i].get<float>();
+        }
+
+        const int32_t n_vocab = llama_vocab_n_tokens(ctx_server.vocab);
+        std::vector<float> logits((size_t) n_vocab);
+        const int32_t rc = llama_model_readout_forward(ctx_server.model, h.data(), logits.data());
+        if (rc != n_vocab) {
+            res->error(format_error_response("readout_forward failed", ERROR_TYPE_SERVER));
+            return res;
+        }
+
+        json out = {
+            { "n_vocab",       n_vocab },
+            { "dtype",         "f32" },
+            { "logits_base64", base64::encode(reinterpret_cast<const char *>(logits.data()), logits.size() * sizeof(float)) },
+        };
+        res->ok(out);
+        return res;
+    };
+
+    // POST /jspace/compare_generation — [obrain] real end-to-end demonstration
+    // of the J-space geometry's practical effect: generates THREE
+    // continuations of the same prompt — baseline (no perturbation),
+    // perturbed along g^out's dominant eigenvector, and perturbed along a
+    // random direction of the SAME Euclidean magnitude — so the caller can
+    // directly read the actual generated TEXT differences, not just an
+    // abstract KL number. Runs on the DEDICATED reserved slot (see
+    // jspace_reserved_slot_id() in server-context.cpp) via the normal task
+    // queue — safe to call while the server is handling concurrent
+    // production traffic on the other slots. Requires the server to be
+    // started with --parallel 3 or more.
+    // Body: { "prompt": string, "scale"?: float (default 0.15), "n_generate"?: int (default 24) }
+    this->post_jspace_compare_generation = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+
+        if (!body.contains("prompt") || !body["prompt"].is_string()) {
+            res->error(format_error_response("'prompt' must be a string", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_JSPACE_COMPARE_GENERATION);
+            task.id = rd.get_new_id();
+            task.jspace_prompt     = body.at("prompt").get<std::string>();
+            task.jspace_scale      = body.value("scale", 0.15f);
+            task.jspace_n_generate = body.value("n_generate", 24);
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        GGML_ASSERT(dynamic_cast<server_task_result_jspace_compare*>(result.get()) != nullptr);
+        res->ok(result->to_json());
+        return res;
+    };
+
+    // POST /jspace/inject_knowledge — [obrain] production entry point for
+    // the KV-splice knowledge-fusion mechanism (PO plan 4749fb72, tâche
+    // P5-T5). Processes `fact_text` once on the reserved slot, extracts
+    // its full state (attention+recurrent), round-trips it (extract+
+    // reinject — the seam a future cross-request cache would split at),
+    // then decodes `prompt` AFTER the spliced fact and generates a
+    // continuation — the fact's literal tokens are never part of the
+    // query's visible context, only its resulting KV/recurrent state.
+    //
+    // Scope limits enforced by design (see server-context.cpp switch case
+    // for the full rationale, backed by empirical findings this session):
+    // ONE fact per call (multi-fact concatenation causes interference),
+    // and NOT intended to override a contested/well-established fact
+    // (four distinct re-injection designs all fail on that use case) —
+    // use only for novel/complementary knowledge.
+    // Body: { "fact_text": string, "prompt": string, "n_generate"?: int (default 24) }
+    this->post_jspace_inject_knowledge = [this](const server_http_req & req) {
+        auto res = create_response();
+        const json body = json::parse(req.body);
+
+        if (!body.contains("fact_text") || !body["fact_text"].is_string()) {
+            res->error(format_error_response("'fact_text' must be a string", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!body.contains("prompt") || !body["prompt"].is_string()) {
+            res->error(format_error_response("'prompt' must be a string", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        auto & rd = res->rd;
+        {
+            server_task task(SERVER_TASK_TYPE_JSPACE_INJECT_KNOWLEDGE);
+            task.id = rd.get_new_id();
+            task.jspace_fact_text  = body.at("fact_text").get<std::string>();
+            task.jspace_prompt     = body.at("prompt").get<std::string>();
+            task.jspace_n_generate = body.value("n_generate", 24);
+            rd.post_task(std::move(task));
+        }
+
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            GGML_ASSERT(req.should_stop());
+            return res;
+        }
+
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+
+        GGML_ASSERT(dynamic_cast<server_task_result_jspace_inject*>(result.get()) != nullptr);
         res->ok(result->to_json());
         return res;
     };

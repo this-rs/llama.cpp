@@ -27,6 +27,8 @@ enum server_task_type {
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_SET_ATTN_MASK,
+    SERVER_TASK_TYPE_JSPACE_COMPARE_GENERATION,
+    SERVER_TASK_TYPE_JSPACE_INJECT_KNOWLEDGE,
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -174,6 +176,18 @@ struct server_task {
     std::vector<llama_pos> attn_mask_pos; // [n_pos]
     int32_t attn_mask_n_head_groups = 0;
     int32_t attn_mask_slot_id = -1;
+
+    // used by SERVER_TASK_TYPE_JSPACE_COMPARE_GENERATION [obrain]
+    std::string jspace_prompt;
+    float       jspace_scale      = 0.15f; // perturbation magnitude, fraction of ||h||_rms
+    int32_t     jspace_n_generate = 24;    // tokens to generate per branch
+
+    // used by SERVER_TASK_TYPE_JSPACE_INJECT_KNOWLEDGE [obrain] — PO plan
+    // 4749fb72, tâche P5-T5. jspace_prompt/jspace_n_generate above are
+    // REUSED here as the query prompt / generation length (kept separate
+    // fields only for the fact text, which has no equivalent in
+    // compare_generation).
+    std::string jspace_fact_text;
 
     server_task() = default;
 
@@ -573,6 +587,31 @@ struct server_task_result_apply_lora : server_task_result {
 };
 
 struct server_task_result_set_attn_mask : server_task_result {
+    virtual json to_json() override;
+};
+
+// [obrain] result of SERVER_TASK_TYPE_JSPACE_COMPARE_GENERATION
+struct server_task_result_jspace_compare : server_task_result {
+    std::string text_baseline;
+    std::string text_eigen;
+    std::string text_random;
+    float  h_rms         = 0.0f;
+    float  top_eigenvalue = 0.0f;
+    double gram_seconds   = 0.0;
+    virtual json to_json() override;
+};
+
+// [obrain] result of SERVER_TASK_TYPE_JSPACE_INJECT_KNOWLEDGE — PO plan
+// 4749fb72, tâche P5-T5. Production entry point for the KV-splice
+// mechanism validated in llm-engine (notes 4392e92f et al.): the fact's
+// tokens are processed once, its full KV/recurrent state is extracted and
+// round-tripped (extract+reinject) into the same reserved sequence, then
+// the query prompt is decoded and generation proceeds — the fact's TEXT
+// is never part of the query's visible context, only its resulting state.
+struct server_task_result_jspace_inject : server_task_result {
+    std::string text;
+    int32_t     fact_tokens = 0;
+    size_t      blob_bytes  = 0;
     virtual json to_json() override;
 };
 

@@ -203,6 +203,11 @@ int main(int argc, char ** argv) {
     ctx_http.post("/lora-adapters",            ex_wrapper(routes.post_lora_adapters));
     // Custom attention mask [obrain]
     ctx_http.post("/attn-mask",                ex_wrapper(routes.post_attn_mask));
+    // J-space geometric analysis [obrain] — PO plan 4749fb72 (cognitive-canvas)
+    ctx_http.get ("/jspace/gram",              ex_wrapper(routes.get_jspace_gram));
+    ctx_http.post("/jspace/readout_forward",   ex_wrapper(routes.post_jspace_readout_forward));
+    ctx_http.post("/jspace/compare_generation", ex_wrapper(routes.post_jspace_compare_generation));
+    ctx_http.post("/jspace/inject_knowledge",  ex_wrapper(routes.post_jspace_inject_knowledge));
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
