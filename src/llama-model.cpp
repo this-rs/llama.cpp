@@ -9259,6 +9259,265 @@ int32_t llama_model_get_mean_token_embedding(
     return n_embd;
 }
 
+// [obrain] J-space — see llama.h for the geometric rationale (g^out = J^T J of
+// the readout). Same dequant-on-read pattern as llama_model_get_mean_token_embedding
+// above: ggml_backend_tensor_get (backend-agnostic: CPU/Metal/CUDA) + generic
+// ggml_get_type_traits(...)->to_float dequantization, no new state added to
+// llama_model — purely additive, reads existing weights only.
+int32_t llama_model_get_output_norm_weight(
+        const llama_model * model,
+        float              * output) {
+    if (!model || !output) {
+        return -1;
+    }
+
+    const auto * output_norm = model->output_norm;
+    if (!output_norm) {
+        return -1;
+    }
+
+    const int32_t n_embd = model->hparams.n_embd;
+    const auto    type   = output_norm->type;
+
+    const size_t blck_size = ggml_blck_size(type);
+    const size_t type_size = ggml_type_size(type);
+    const size_t row_bytes = ((size_t) n_embd / blck_size) * type_size;
+
+    std::vector<uint8_t> raw(row_bytes);
+    ggml_backend_tensor_get(output_norm, raw.data(), 0, row_bytes);
+
+    if (type == GGML_TYPE_F32) {
+        memcpy(output, raw.data(), n_embd * sizeof(float));
+    } else {
+        const auto * traits = ggml_get_type_traits(type);
+        traits->to_float(raw.data(), output, n_embd);
+    }
+
+    return n_embd;
+}
+
+int32_t llama_model_get_output_gram_matrix(
+        const llama_model * model,
+        float              * output_gram) {
+    if (!model || !output_gram) {
+        return -1;
+    }
+
+    const auto * output = model->output;
+    if (!output) {
+        return -1;
+    }
+
+    const int32_t n_embd  = model->hparams.n_embd;
+    const int32_t n_vocab = (int32_t) model->vocab.n_tokens();
+    const auto    type    = output->type;
+
+    const size_t blck_size = ggml_blck_size(type);
+    const size_t type_size = ggml_type_size(type);
+    const size_t row_bytes = ((size_t) n_embd / blck_size) * type_size;
+
+    std::vector<uint8_t> raw(row_bytes);
+    std::vector<float>   row(n_embd);
+    const auto * traits = ggml_get_type_traits(type);
+    const bool is_f32 = (type == GGML_TYPE_F32);
+
+    memset(output_gram, 0, (size_t) n_embd * n_embd * sizeof(float));
+
+    // gram is symmetric (w^T w) — accumulate only the upper triangle, mirror
+    // at the end. Halves the O(n_vocab * n_embd^2) inner-loop work.
+    for (int32_t v = 0; v < n_vocab; ++v) {
+        ggml_backend_tensor_get(output, raw.data(), (size_t) v * row_bytes, row_bytes);
+
+        const float * w;
+        if (is_f32) {
+            w = reinterpret_cast<const float *>(raw.data());
+        } else {
+            traits->to_float(raw.data(), row.data(), n_embd);
+            w = row.data();
+        }
+
+        for (int32_t i = 0; i < n_embd; ++i) {
+            const float wi = w[i];
+            if (wi == 0.0f) continue;
+            float * grow = output_gram + (size_t) i * n_embd;
+            for (int32_t j = i; j < n_embd; ++j) {
+                grow[j] += wi * w[j];
+            }
+        }
+    }
+
+    for (int32_t i = 0; i < n_embd; ++i) {
+        for (int32_t j = i + 1; j < n_embd; ++j) {
+            output_gram[(size_t) j * n_embd + i] = output_gram[(size_t) i * n_embd + j];
+        }
+    }
+
+    return n_embd;
+}
+
+// [obrain] H4 — readout forward pass (RMSNorm + matmul), ground truth for
+// validating the g^out pullback prediction against real logits/KL. See
+// llama.h for the rationale. O(n_vocab * n_embd) — cheap enough to call once
+// per perturbation delta, unlike the Gram matrix above (call once, cache).
+int32_t llama_model_readout_forward(
+        const llama_model * model,
+        const float        * h,
+        float               * logits_out) {
+    if (!model || !h || !logits_out) {
+        return -1;
+    }
+
+    const auto * output      = model->output;
+    const auto * output_norm = model->output_norm;
+    if (!output || !output_norm) {
+        return -1;
+    }
+
+    const int32_t n_embd  = model->hparams.n_embd;
+    const int32_t n_vocab = (int32_t) model->vocab.n_tokens();
+    const float   eps     = model->hparams.f_norm_rms_eps;
+
+    // Dequantize output_norm.weight (gamma) — small, one-shot read.
+    std::vector<float> gamma(n_embd);
+    {
+        const auto   type       = output_norm->type;
+        const size_t blck_size  = ggml_blck_size(type);
+        const size_t type_size  = ggml_type_size(type);
+        const size_t row_bytes  = ((size_t) n_embd / blck_size) * type_size;
+        std::vector<uint8_t> raw(row_bytes);
+        ggml_backend_tensor_get(output_norm, raw.data(), 0, row_bytes);
+        if (type == GGML_TYPE_F32) {
+            memcpy(gamma.data(), raw.data(), n_embd * sizeof(float));
+        } else {
+            ggml_get_type_traits(type)->to_float(raw.data(), gamma.data(), n_embd);
+        }
+    }
+
+    // y = rmsnorm(h) * gamma
+    double sum_sq = 0.0;
+    for (int32_t i = 0; i < n_embd; ++i) {
+        sum_sq += (double) h[i] * (double) h[i];
+    }
+    const float rms = (float) std::sqrt(sum_sq / n_embd + (double) eps);
+    std::vector<float> y(n_embd);
+    for (int32_t i = 0; i < n_embd; ++i) {
+        y[i] = (h[i] / rms) * gamma[i];
+    }
+
+    // logits = output.weight @ y, streamed over n_vocab rows (dequant on
+    // read, same pattern as the Gram matrix — never materializes the full
+    // [n_vocab, n_embd] dequantized matrix).
+    const auto   type      = output->type;
+    const size_t blck_size = ggml_blck_size(type);
+    const size_t type_size = ggml_type_size(type);
+    const size_t row_bytes = ((size_t) n_embd / blck_size) * type_size;
+    std::vector<uint8_t> raw(row_bytes);
+    std::vector<float>   row(n_embd);
+    const auto * traits = ggml_get_type_traits(type);
+    const bool is_f32 = (type == GGML_TYPE_F32);
+
+    for (int32_t v = 0; v < n_vocab; ++v) {
+        ggml_backend_tensor_get(output, raw.data(), (size_t) v * row_bytes, row_bytes);
+        const float * w;
+        if (is_f32) {
+            w = reinterpret_cast<const float *>(raw.data());
+        } else {
+            traits->to_float(raw.data(), row.data(), n_embd);
+            w = row.data();
+        }
+        double acc = 0.0;
+        for (int32_t i = 0; i < n_embd; ++i) {
+            acc += (double) w[i] * (double) y[i];
+        }
+        logits_out[v] = (float) acc;
+    }
+
+    return n_vocab;
+}
+
+// [obrain] Fisher/KL pullback support — see llama.h for the rationale.
+// Streams only the top-k highest-probability rows of output.weight (a
+// well-justified approximation for peaked distributions), not the full
+// vocabulary — this is what keeps the per-activation cost tractable versus
+// the plain Gram matrix above (which must instead be a model constant,
+// computed once, precisely because it can't afford this shortcut).
+int32_t llama_model_get_weighted_gram_topk(
+        const llama_model * model,
+        const float        * p,
+        int32_t              k,
+        float               * weighted_gram_out,
+        float               * weighted_mean_out) {
+    if (!model || !p || !weighted_gram_out || !weighted_mean_out || k <= 0) {
+        return -1;
+    }
+
+    const auto * output = model->output;
+    if (!output) {
+        return -1;
+    }
+
+    const int32_t n_embd  = model->hparams.n_embd;
+    const int32_t n_vocab = (int32_t) model->vocab.n_tokens();
+    const int32_t kk = std::min(k, n_vocab);
+
+    // Partial-sort token indices by descending probability — only the top
+    // kk rows of output.weight will actually be read.
+    std::vector<int32_t> idx(n_vocab);
+    for (int32_t v = 0; v < n_vocab; ++v) {
+        idx[v] = v;
+    }
+    std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(),
+        [&](int32_t a, int32_t b) { return p[a] > p[b]; });
+
+    const auto   type      = output->type;
+    const size_t blck_size = ggml_blck_size(type);
+    const size_t type_size = ggml_type_size(type);
+    const size_t row_bytes = ((size_t) n_embd / blck_size) * type_size;
+    std::vector<uint8_t> raw(row_bytes);
+    std::vector<float>   row(n_embd);
+    const auto * traits = ggml_get_type_traits(type);
+    const bool is_f32 = (type == GGML_TYPE_F32);
+
+    memset(weighted_gram_out, 0, (size_t) n_embd * n_embd * sizeof(float));
+    memset(weighted_mean_out, 0, (size_t) n_embd * sizeof(float));
+
+    for (int32_t t = 0; t < kk; ++t) {
+        const int32_t v  = idx[t];
+        const float   pv = p[v];
+        if (pv <= 0.0f) continue;
+
+        ggml_backend_tensor_get(output, raw.data(), (size_t) v * row_bytes, row_bytes);
+        const float * w;
+        if (is_f32) {
+            w = reinterpret_cast<const float *>(raw.data());
+        } else {
+            traits->to_float(raw.data(), row.data(), n_embd);
+            w = row.data();
+        }
+
+        for (int32_t i = 0; i < n_embd; ++i) {
+            weighted_mean_out[i] += pv * w[i];
+        }
+
+        for (int32_t i = 0; i < n_embd; ++i) {
+            const float wi = pv * w[i];
+            if (wi == 0.0f) continue;
+            float * grow = weighted_gram_out + (size_t) i * n_embd;
+            for (int32_t j = i; j < n_embd; ++j) {
+                grow[j] += wi * w[j];
+            }
+        }
+    }
+
+    for (int32_t i = 0; i < n_embd; ++i) {
+        for (int32_t j = i + 1; j < n_embd; ++j) {
+            weighted_gram_out[(size_t) j * n_embd + i] = weighted_gram_out[(size_t) i * n_embd + j];
+        }
+    }
+
+    return n_embd;
+}
+
 // deprecated
 int32_t llama_n_ctx_train(const llama_model * model) {
     return llama_model_n_ctx_train(model);

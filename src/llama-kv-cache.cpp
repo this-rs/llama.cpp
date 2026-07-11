@@ -2940,6 +2940,87 @@ int32_t llama_kv_cache::inject_layer(
     return 0;
 }
 
+int32_t llama_kv_cache::extract_layer(
+        llama_seq_id     seq_id,
+        const llama_pos * pos,
+              void      * k_data,
+              void      * v_data,
+        int32_t           n_tokens,
+        int32_t           layer_idx) {
+    if (!pos || !k_data || !v_data || n_tokens <= 0 || seq_id < 0) {
+        LLAMA_LOG_ERROR("%s: invalid parameters\n", __func__);
+        return -1;
+    }
+
+    auto it = map_layer_ids.find(layer_idx);
+    if (it == map_layer_ids.end()) {
+        LLAMA_LOG_ERROR("%s: layer %d not found in KV cache\n", __func__, layer_idx);
+        return -1;
+    }
+    const uint32_t li = it->second;
+
+    const uint32_t strm = (seq_id < (int32_t) seq_to_stream.size()) ? seq_to_stream[seq_id] : 0;
+    auto & cells = v_cells[strm];
+
+    // Find cells for the requested positions (must already exist)
+    std::vector<uint32_t> existing_idxs;
+    existing_idxs.reserve(n_tokens);
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        bool found = false;
+        for (uint32_t c = 0; c < cells.size(); ++c) {
+            if (cells.pos_get(c) == pos[i] && cells.seq_has(c, seq_id)) {
+                existing_idxs.push_back(c);
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            LLAMA_LOG_ERROR("%s: position %d not found in cache for seq_id=%d (extract requires prior prefill)\n",
+                            __func__, pos[i], seq_id);
+            return -2;
+        }
+    }
+
+    const auto & layer = layers[li];
+    auto * k_tensor = layer.k_stream[strm];
+    const size_t k_row_size = ggml_row_size(k_tensor->type, k_tensor->ne[0]);
+
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        const uint32_t cell_idx = existing_idxs[i];
+        const size_t src_offset = cell_idx * k_row_size;
+        ggml_backend_tensor_get(k_tensor, (uint8_t *) k_data + i * k_row_size, src_offset, k_row_size);
+    }
+
+    auto * v_tensor = layer.v_stream[strm];
+    if (!v_trans) {
+        const size_t v_row_size = ggml_row_size(v_tensor->type, v_tensor->ne[0]);
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            const uint32_t cell_idx = existing_idxs[i];
+            const size_t src_offset = cell_idx * v_row_size;
+            ggml_backend_tensor_get(v_tensor, (uint8_t *) v_data + i * v_row_size, src_offset, v_row_size);
+        }
+    } else {
+        // Transposed V tensor: [kv_size, n_embd_v_gqa] — read element-by-element back to logical [n_tokens][n_embd_v_gqa]
+        const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(layer.il);
+        const size_t v_size_el = ggml_type_size(v_tensor->type);
+        const uint32_t kv_size = cells.size();
+
+        for (int32_t i = 0; i < n_tokens; ++i) {
+            const uint32_t cell_idx = existing_idxs[i];
+            for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+                const size_t src_offset = (cell_idx + j * kv_size) * v_size_el;
+                const size_t dst_offset = (i * n_embd_v_gqa + j) * v_size_el;
+                ggml_backend_tensor_get(v_tensor, (uint8_t *) v_data + dst_offset, src_offset, v_size_el);
+            }
+        }
+    }
+
+    LLAMA_LOG_DEBUG("%s: extracted %d tokens from layer %d (seq_id=%d)\n",
+        __func__, n_tokens, layer_idx, seq_id);
+
+    return 0;
+}
+
 //
 // llama_kv_cache_context
 //

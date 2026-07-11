@@ -346,6 +346,20 @@ public:
             int32_t           n_tokens,
             int32_t           layer_idx);
 
+    // Extract K/V for a single layer at the given positions (mirror of inject_layer).
+    // The cells must already exist for the (pos, seq_id) pairs — this reads directly
+    // from cache. Used to produce per-layer oracle K/V for student-distillation
+    // training, or to demonstrate prefill-bypass via inject of a previously-extracted
+    // K/V state into a fresh seq.
+    // Returns 0 on success, negative on error.
+    int32_t extract_layer(
+            llama_seq_id     seq_id,
+            const llama_pos * pos,
+                  void      * k_data,  // [n_tokens][n_embd_k_gqa] in cache native type
+                  void      * v_data,  // [n_tokens][n_embd_v_gqa] in cache native type
+            int32_t           n_tokens,
+            int32_t           layer_idx);
+
     ggml_type get_type_k() const { return layers.empty() ? GGML_TYPE_F16 : layers[0].k->type; }
     ggml_type get_type_v() const { return layers.empty() ? GGML_TYPE_F16 : layers[0].v->type; }
 };
