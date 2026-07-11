@@ -500,15 +500,7 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "iq4_nl") {
         return GGML_TYPE_IQ4_NL;
     }
-    if (s == "turbo2") {
-        return GGML_TYPE_TURBO2_0;
-    }
-    if (s == "turbo3") {
-        return GGML_TYPE_TURBO3_0;
-    }
-    if (s == "turbo4") {
-        return GGML_TYPE_TURBO4_0;
-    }
+    // [obrain] TurboQuant KV types dropped in the 2026-07 upstream merge.
 
     return GGML_TYPE_COUNT;
 }
