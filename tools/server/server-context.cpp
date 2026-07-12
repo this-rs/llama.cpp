@@ -2718,6 +2718,64 @@ private:
                     res->t_ms     = t_restore_ms;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_SLOT_COMPACT:
+                {
+                    // [obrain LONG-RESUME] phantom-prefix compaction: free the attention
+                    // KV cells of the prefix, keep the last tail_m cells + the recurrent
+                    // state, and deliberately LEAVE slot->prompt.tokens intact so future
+                    // requests still prompt-match the full history (no re-prefill; the
+                    // model attends over tail + recurrent only). tail_m < 0 = info only.
+                    if (!check_no_mtmd(task.id)) {
+                        break;
+                    }
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    llama_memory_t mem = llama_get_memory(ctx_tgt);
+                    const llama_pos pos_min_before = llama_memory_seq_pos_min(mem, slot->id);
+                    const llama_pos pos_max_before = llama_memory_seq_pos_max(mem, slot->id);
+                    const int64_t cells_before = pos_max_before >= 0 ? (int64_t) (pos_max_before - pos_min_before + 1) : 0;
+
+                    const int32_t tail_m = task.slot_action.tail_m;
+                    bool compacted = false;
+                    if (tail_m >= 0 && pos_max_before >= 0) {
+                        const llama_pos p1 = pos_max_before + 1 - tail_m;
+                        if (p1 > pos_min_before) {
+                            // PREFIX removal [0, p1): frees attention cells; positions are
+                            // NOT rebased and the recurrent state survives (validated —
+                            // obrain LONG-RESUME phase A). The bool MUST be checked: on
+                            // hybrid models a refused partial removal is a silent no-op.
+                            if (!llama_memory_seq_rm(mem, slot->id, 0, p1)) {
+                                send_error(task, "seq_rm(prefix) refused by model memory (hybrid partial removal)", ERROR_TYPE_SERVER);
+                                break;
+                            }
+                            compacted = true;
+                        }
+                    }
+
+                    const llama_pos pos_min_after = llama_memory_seq_pos_min(mem, slot->id);
+                    const llama_pos pos_max_after = llama_memory_seq_pos_max(mem, slot->id);
+
+                    auto res = std::make_unique<server_task_result_slot_compact>();
+                    res->id              = task.id;
+                    res->compacted       = compacted;
+                    res->tail_m          = tail_m;
+                    res->cells_before    = cells_before;
+                    res->cells_after     = pos_max_after >= 0 ? (int64_t) (pos_max_after - pos_min_after + 1) : 0;
+                    res->pos_min         = pos_min_after;
+                    res->pos_max         = pos_max_after;
+                    res->n_prompt_tokens = slot->prompt.tokens.size();
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
                 {
                     if (!check_no_mtmd(task.id)) {
@@ -4951,10 +5009,6 @@ void server_routes::init_routes() {
 
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();
-        if (params.slot_save_path.empty()) {
-            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
-            return res;
-        }
 
         std::string id_slot_str = req.get_param("id_slot");
 
@@ -4967,6 +5021,16 @@ void server_routes::init_routes() {
         }
 
         std::string action = req.get_param("action");
+
+        // [obrain LONG-RESUME] compaction/info — no --slot-save-path required
+        if (action == "compact" || action == "info") {
+            return handle_slots_compact(req, id_slot, action == "compact");
+        }
+
+        if (params.slot_save_path.empty()) {
+            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
 
         if (action == "save") {
             return handle_slots_save(req, id_slot);
@@ -5900,6 +5964,49 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_restore(const 
     }
 
     GGML_ASSERT(dynamic_cast<server_task_result_slot_save_load*>(result.get()) != nullptr);
+    res->ok(result->to_json());
+    return res;
+}
+
+// [obrain LONG-RESUME] POST /slots/:id?action=compact  body {"tail_m": N}
+//                      POST /slots/:id?action=info     (no body) — stats only
+std::unique_ptr<server_res_generator> server_routes::handle_slots_compact(const server_http_req & req, int id_slot, bool do_compact) {
+    auto res = create_response();
+
+    int32_t tail_m = -1;
+    if (do_compact) {
+        json request_data = json::object();
+        if (!req.body.empty()) {
+            request_data = json::parse(req.body);
+        }
+        tail_m = request_data.value("tail_m", 256);
+        if (tail_m < 0) {
+            res->error(format_error_response("tail_m must be >= 0", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+    }
+
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_COMPACT);
+        task.id = rd.get_new_id();
+        task.slot_action.id_slot = id_slot;
+        task.slot_action.tail_m  = tail_m;
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        // connection was closed
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
     res->ok(result->to_json());
     return res;
 }

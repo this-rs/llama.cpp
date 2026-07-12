@@ -25,6 +25,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_SAVE,
     SERVER_TASK_TYPE_SLOT_RESTORE,
     SERVER_TASK_TYPE_SLOT_ERASE,
+    SERVER_TASK_TYPE_SLOT_COMPACT, // [obrain LONG-RESUME] phantom-prefix compaction
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
     SERVER_TASK_TYPE_SET_ATTN_MASK,
@@ -169,6 +170,9 @@ struct server_task {
         int id_slot;
         std::string filename;
         std::string filepath;
+        // [obrain LONG-RESUME] used by SERVER_TASK_TYPE_SLOT_COMPACT:
+        // keep only the last `tail_m` attention cells (-1 = info only, no removal)
+        int32_t tail_m = -1;
     };
     slot_action slot_action;
 
@@ -569,6 +573,30 @@ struct server_task_result_slot_save_load : server_task_result {
     double t_ms;
 
     virtual json to_json() override;
+};
+
+// [obrain LONG-RESUME] result of SERVER_TASK_TYPE_SLOT_COMPACT.
+// Reports the attention-cell window before/after the phantom-prefix compaction.
+struct server_task_result_slot_compact : server_task_result {
+    bool    compacted = false;
+    int32_t tail_m = -1;
+    int64_t cells_before = 0;
+    int64_t cells_after = 0;
+    int64_t pos_min = -1;
+    int64_t pos_max = -1;
+    size_t  n_prompt_tokens = 0;
+
+    virtual json to_json() override {
+        return json {
+            { "compacted",       compacted },
+            { "tail_m",          tail_m },
+            { "cells_before",    cells_before },
+            { "cells_after",     cells_after },
+            { "pos_min",         pos_min },
+            { "pos_max",         pos_max },
+            { "n_prompt_tokens", n_prompt_tokens },
+        };
+    }
 };
 
 struct server_task_result_slot_erase : server_task_result {
