@@ -820,6 +820,19 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
+    // [obrain] Attention-only variant: on HYBRID models (attention + recurrent), removes
+    // cells ONLY from the attention KV cache and leaves the recurrent (SSM) state
+    // untouched. Needed because the recurrent cache cannot rewind, so llama_memory_seq_rm
+    // refuses partial/suffix removals on hybrids (silent no-op for the caller). The caller
+    // is responsible for restoring the recurrent state separately if needed
+    // (llama_state_seq_set_data_ext with LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY).
+    // Non-hybrid memories: behaves exactly like llama_memory_seq_rm.
+    LLAMA_API bool llama_memory_seq_rm_attn(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1);
+
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)

@@ -4421,6 +4421,24 @@ bool llama_memory_seq_rm(
     return mem->seq_rm(seq_id, p0, p1);
 }
 
+// [obrain] attention-only seq_rm — see include/llama.h for rationale
+bool llama_memory_seq_rm_attn(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1) {
+    if (!mem) {
+        return true;
+    }
+    if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return hyb->get_mem_attn()->seq_rm(seq_id, p0, p1);
+    }
+    if (auto * hyb_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        return hyb_iswa->get_mem_attn()->seq_rm(seq_id, p0, p1);
+    }
+    return mem->seq_rm(seq_id, p0, p1);
+}
+
 void llama_memory_seq_cp(
         llama_memory_t mem,
           llama_seq_id seq_id_src,
