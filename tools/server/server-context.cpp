@@ -2772,6 +2772,7 @@ private:
                     res->id              = task.id;
                     res->compacted       = compacted;
                     res->tail_m          = tail_m;
+                    res->n_ctx           = slot->n_ctx;
                     res->cells_before    = cells_before;
                     res->cells_after     = pos_max_after >= 0 ? (int64_t) (pos_max_after - pos_min_after + 1) : 0;
                     res->pos_min         = pos_min_after;

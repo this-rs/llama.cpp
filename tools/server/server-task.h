@@ -580,6 +580,7 @@ struct server_task_result_slot_save_load : server_task_result {
 struct server_task_result_slot_compact : server_task_result {
     bool    compacted = false;
     int32_t tail_m = -1;
+    int32_t n_ctx = 0;   // capacité du slot (cellules) — pour les seuils RELATIFS côté client
     int64_t cells_before = 0;
     int64_t cells_after = 0;
     int64_t pos_min = -1;
@@ -590,6 +591,7 @@ struct server_task_result_slot_compact : server_task_result {
         return json {
             { "compacted",       compacted },
             { "tail_m",          tail_m },
+            { "n_ctx",           n_ctx },
             { "cells_before",    cells_before },
             { "cells_after",     cells_after },
             { "pos_min",         pos_min },
