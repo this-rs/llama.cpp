@@ -2741,8 +2741,11 @@ private:
                     }
 
                     llama_memory_t mem = llama_get_memory(ctx_tgt);
-                    const llama_pos pos_min_before = llama_memory_seq_pos_min(mem, slot->id);
-                    const llama_pos pos_max_before = llama_memory_seq_pos_max(mem, slot->id);
+                    // ATTENTION-only view: on hybrid models the combined pos_min/max
+                    // collapse to the recurrent cell ([last,last]) and would both hide
+                    // the real cell window and wrongly refuse the compaction.
+                    const llama_pos pos_min_before = llama_memory_seq_pos_min_attn(mem, slot->id);
+                    const llama_pos pos_max_before = llama_memory_seq_pos_max_attn(mem, slot->id);
                     const int64_t cells_before = pos_max_before >= 0 ? (int64_t) (pos_max_before - pos_min_before + 1) : 0;
 
                     const int32_t tail_m = task.slot_action.tail_m;
@@ -2762,8 +2765,8 @@ private:
                         }
                     }
 
-                    const llama_pos pos_min_after = llama_memory_seq_pos_min(mem, slot->id);
-                    const llama_pos pos_max_after = llama_memory_seq_pos_max(mem, slot->id);
+                    const llama_pos pos_min_after = llama_memory_seq_pos_min_attn(mem, slot->id);
+                    const llama_pos pos_max_after = llama_memory_seq_pos_max_attn(mem, slot->id);
 
                     auto res = std::make_unique<server_task_result_slot_compact>();
                     res->id              = task.id;

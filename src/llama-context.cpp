@@ -4421,6 +4421,33 @@ bool llama_memory_seq_rm(
     return mem->seq_rm(seq_id, p0, p1);
 }
 
+// [obrain] attention-only position range — see include/llama.h for rationale
+llama_pos llama_memory_seq_pos_min_attn(llama_memory_t mem, llama_seq_id seq_id) {
+    if (!mem) {
+        return -1;
+    }
+    if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return hyb->get_mem_attn()->seq_pos_min(seq_id);
+    }
+    if (auto * hyb_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        return hyb_iswa->get_mem_attn()->seq_pos_min(seq_id);
+    }
+    return mem->seq_pos_min(seq_id);
+}
+
+llama_pos llama_memory_seq_pos_max_attn(llama_memory_t mem, llama_seq_id seq_id) {
+    if (!mem) {
+        return -1;
+    }
+    if (auto * hyb = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        return hyb->get_mem_attn()->seq_pos_max(seq_id);
+    }
+    if (auto * hyb_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        return hyb_iswa->get_mem_attn()->seq_pos_max(seq_id);
+    }
+    return mem->seq_pos_max(seq_id);
+}
+
 // [obrain] attention-only seq_rm — see include/llama.h for rationale
 bool llama_memory_seq_rm_attn(
         llama_memory_t mem,

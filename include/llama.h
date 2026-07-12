@@ -833,6 +833,13 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
+    // [obrain] Attention-only position range: on hybrid models the combined
+    // seq_pos_min/max collapse to the recurrent cell's position ([last, last]),
+    // which hides the attention window. These return the ATTENTION cache's view.
+    // Non-hybrid memories: same as llama_memory_seq_pos_min/max.
+    LLAMA_API llama_pos llama_memory_seq_pos_min_attn(llama_memory_t mem, llama_seq_id seq_id);
+    LLAMA_API llama_pos llama_memory_seq_pos_max_attn(llama_memory_t mem, llama_seq_id seq_id);
+
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)
